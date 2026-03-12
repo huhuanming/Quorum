@@ -541,6 +541,9 @@ struct ContentView: View {
                             )
                         } label: {
                             HStack(alignment: .center, spacing: 8) {
+                                Text(participant.resolvedAvatarEmoji)
+                                    .font(.title3)
+                                    .frame(width: 30)
                                 VStack(alignment: .leading, spacing: 4) {
                                     Text(participant.displayName)
                                         .font(.subheadline.weight(.semibold))
@@ -1049,6 +1052,8 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(spacing: 10) {
                     HStack(spacing: 8) {
+                        Text("头像")
+                            .frame(width: 64, alignment: .center)
                         Text("名称（会自动生成 alias）")
                             .frame(maxWidth: .infinity, alignment: .leading)
                         Text("Provider")
@@ -1069,6 +1074,18 @@ struct ContentView: View {
                     ForEach($createDraft.participants) { $participant in
                         VStack(alignment: .leading, spacing: 8) {
                             HStack(spacing: 8) {
+                                Button {
+                                    participant.avatarEmoji = MeetingCreationDraft.randomAvatarEmoji(excluding: participant.avatarEmoji)
+                                } label: {
+                                    Text(participant.avatarEmoji)
+                                        .font(.title3)
+                                        .frame(width: 44, height: 34)
+                                        .background(palette.inputBackground)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                }
+                                .buttonStyle(.plain)
+                                .help("点击切换头像")
+
                                 TextField("角色名或昵称", text: $participant.displayName)
                                     .textFieldStyle(.roundedBorder)
 
@@ -1946,22 +1963,33 @@ private struct ChatBubbleRow: View {
         }
     }
 
+    @ViewBuilder
     private var avatar: some View {
-        let initials = participant?.displayName
-            .split(separator: " ")
-            .prefix(2)
-            .compactMap { $0.first }
-            .map(String.init)
-            .joined() ?? String(message.fromAlias.prefix(2)).uppercased()
+        if let emoji = participant?.resolvedAvatarEmoji {
+            Text(emoji)
+                .font(.title3)
+                .frame(width: 34, height: 34)
+                .background(
+                    Circle()
+                        .fill(isFromCurrentUser ? palette.accent.opacity(0.2) : palette.chipBackground)
+                )
+        } else {
+            let initials = participant?.displayName
+                .split(separator: " ")
+                .prefix(2)
+                .compactMap { $0.first }
+                .map(String.init)
+                .joined() ?? String(message.fromAlias.prefix(2)).uppercased()
 
-        return Text(initials.uppercased())
-            .font(.caption.bold())
-            .foregroundStyle(.white)
-            .frame(width: 34, height: 34)
-            .background(
-                Circle()
-                    .fill(isFromCurrentUser ? palette.accent : Color(red: 0.0, green: 0.58, blue: 0.54))
-            )
+            Text(initials.uppercased())
+                .font(.caption.bold())
+                .foregroundStyle(.white)
+                .frame(width: 34, height: 34)
+                .background(
+                    Circle()
+                        .fill(isFromCurrentUser ? palette.accent : Color(red: 0.0, green: 0.58, blue: 0.54))
+                )
+        }
     }
 
     private func copyMessageContent() {
@@ -2084,6 +2112,7 @@ private struct MeetingCreationParticipantDraft: Identifiable, Hashable {
     let id: UUID
     var alias: String
     var displayName: String
+    var avatarEmoji: String
     var provider: String
     var model: String
     var role: ParticipantRole
@@ -2094,6 +2123,7 @@ private struct MeetingCreationParticipantDraft: Identifiable, Hashable {
         id: UUID = UUID(),
         alias: String,
         displayName: String,
+        avatarEmoji: String = "🙂",
         provider: String,
         model: String,
         role: ParticipantRole,
@@ -2103,6 +2133,7 @@ private struct MeetingCreationParticipantDraft: Identifiable, Hashable {
         self.id = id
         self.alias = alias
         self.displayName = displayName
+        self.avatarEmoji = avatarEmoji
         self.provider = provider
         self.model = model
         self.role = role
@@ -2141,6 +2172,7 @@ private struct MeetingCreationParticipantDraft: Identifiable, Hashable {
         MeetingCreationParticipantDraft(
             alias: "agent-\(index)",
             displayName: ParticipantRole.observer.displayName,
+            avatarEmoji: MeetingCreationDraft.randomAvatarEmoji(),
             provider: MeetingCreationParticipantProvider.codex.rawValue,
             model: "gpt-5.3-codex",
             role: .observer,
@@ -2172,6 +2204,7 @@ private struct MeetingCreationParticipantDraft: Identifiable, Hashable {
         return Participant(
             alias: normalizedAlias,
             displayName: normalizedDisplayName.isEmpty ? role.displayName : normalizedDisplayName,
+            avatarEmoji: avatarEmoji.trimmingCharacters(in: .whitespacesAndNewlines),
             provider: normalizedProvider,
             model: normalizedModel,
             roles: [role],
@@ -2195,6 +2228,11 @@ private struct MeetingCreationDraft {
     static let requiredSelfAlias = "me"
     static let roleDefaultSkillTemplateID = "__role_default__"
     static let noSkillTemplateID = "__no_skill__"
+    static let avatarEmojiOptions: [String] = [
+        "😀", "😎", "🤖", "🧠", "🛠️", "🧩", "🧭", "🔍", "🧪", "⚙️",
+        "🚀", "🦊", "🐼", "🐙", "🦉", "🐯", "🦁", "🐬", "🐧", "🦄",
+        "🍀", "🔥", "🌊", "🌟", "☁️", "🌈", "🎯", "📌", "📎", "📘",
+    ]
 
     static let builtInMeetingSkillTemplates: [MeetingSkillTemplateDraft] = [
         MeetingSkillTemplateDraft(
@@ -2262,46 +2300,53 @@ private struct MeetingCreationDraft {
         ),
     ]
 
-    static let requiredSelfParticipant = MeetingCreationParticipantDraft(
-        alias: requiredSelfAlias,
-        displayName: "You",
-        provider: MeetingCreationParticipantProvider.human.rawValue,
-        model: MeetingCreationParticipantProvider.human.defaultModel,
-        role: .host,
-        skillTemplateID: noSkillTemplateID,
-        isSelf: true
-    )
+    static var requiredSelfParticipant: MeetingCreationParticipantDraft {
+        MeetingCreationParticipantDraft(
+            alias: requiredSelfAlias,
+            displayName: "You",
+            avatarEmoji: randomAvatarEmoji(),
+            provider: MeetingCreationParticipantProvider.human.rawValue,
+            model: MeetingCreationParticipantProvider.human.defaultModel,
+            role: .host,
+            skillTemplateID: noSkillTemplateID,
+            isSelf: true
+        )
+    }
 
-    static let defaultValue = MeetingCreationDraft(
-        title: "",
-        goal: "",
-        autoStart: true,
-        speakingMode: .judgeGated,
-        judgeAutoDecision: true,
-        maxConcurrentAgents: 1,
-        meetingDefaultSkillTemplateID: builtInMeetingSkillTemplates.first?.id ?? "builtin:meeting-core",
-        selectedAdditionalSkillTemplateIDs: [],
-        importedSkillTemplates: [],
-        participants: [
-            requiredSelfParticipant,
-            MeetingCreationParticipantDraft(
-                alias: "claude-a",
-                displayName: "planner",
-                provider: MeetingCreationParticipantProvider.claude.rawValue,
-                model: "claude-sonnet",
-                role: .planner,
-                skillTemplateID: roleDefaultSkillTemplateID
-            ),
-            MeetingCreationParticipantDraft(
-                alias: "codex-r1",
-                displayName: "reviewer",
-                provider: MeetingCreationParticipantProvider.codex.rawValue,
-                model: "gpt-5.3-codex",
-                role: .reviewer,
-                skillTemplateID: roleDefaultSkillTemplateID
-            ),
-        ]
-    )
+    static var defaultValue: MeetingCreationDraft {
+        MeetingCreationDraft(
+            title: "",
+            goal: "",
+            autoStart: true,
+            speakingMode: .judgeGated,
+            judgeAutoDecision: true,
+            maxConcurrentAgents: 1,
+            meetingDefaultSkillTemplateID: builtInMeetingSkillTemplates.first?.id ?? "builtin:meeting-core",
+            selectedAdditionalSkillTemplateIDs: [],
+            importedSkillTemplates: [],
+            participants: [
+                requiredSelfParticipant,
+                MeetingCreationParticipantDraft(
+                    alias: "claude-a",
+                    displayName: "planner",
+                    avatarEmoji: randomAvatarEmoji(),
+                    provider: MeetingCreationParticipantProvider.claude.rawValue,
+                    model: "claude-sonnet",
+                    role: .planner,
+                    skillTemplateID: roleDefaultSkillTemplateID
+                ),
+                MeetingCreationParticipantDraft(
+                    alias: "codex-r1",
+                    displayName: "reviewer",
+                    avatarEmoji: randomAvatarEmoji(),
+                    provider: MeetingCreationParticipantProvider.codex.rawValue,
+                    model: "gpt-5.3-codex",
+                    role: .reviewer,
+                    skillTemplateID: roleDefaultSkillTemplateID
+                ),
+            ]
+        )
+    }
 
     static func copied(from meeting: Meeting) -> MeetingCreationDraft {
         var importedSkillTemplates: [MeetingSkillTemplateDraft] = []
@@ -2339,6 +2384,11 @@ private struct MeetingCreationDraft {
                 if !copiedName.isEmpty {
                     selfDraft.displayName = copiedName
                 }
+                if let copiedAvatar = participant.avatarEmoji?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !copiedAvatar.isEmpty
+                {
+                    selfDraft.avatarEmoji = copiedAvatar
+                }
                 selfDraft.role = participant.primaryRole
                 copiedParticipants.append(selfDraft)
                 hasSelf = true
@@ -2365,6 +2415,7 @@ private struct MeetingCreationDraft {
             var copiedParticipant = MeetingCreationParticipantDraft(
                 alias: participant.alias,
                 displayName: participant.displayName,
+                avatarEmoji: participant.resolvedAvatarEmoji,
                 provider: participant.provider,
                 model: participant.model,
                 role: role,
@@ -2584,6 +2635,18 @@ private struct MeetingCreationDraft {
             == skillContent.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    static func randomAvatarEmoji(excluding current: String? = nil) -> String {
+        let normalizedCurrent = current?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let candidates = avatarEmojiOptions.filter { option in
+            guard let normalizedCurrent, !normalizedCurrent.isEmpty else { return true }
+            return option != normalizedCurrent
+        }
+        if let selected = candidates.randomElement() {
+            return selected
+        }
+        return avatarEmojiOptions.first ?? "🙂"
+    }
+
     private static func makeCopiedTitle(from title: String) -> String {
         let marker = " - 副本"
         let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2714,6 +2777,33 @@ private extension ParticipantRole {
         case .observer:
             return "observer"
         }
+    }
+
+    var defaultAvatarEmoji: String {
+        switch self {
+        case .host:
+            return "🎙️"
+        case .planner:
+            return "🧭"
+        case .reviewer:
+            return "🔍"
+        case .judge:
+            return "⚖️"
+        case .observer:
+            return "👀"
+        }
+    }
+}
+
+private extension Participant {
+    var resolvedAvatarEmoji: String {
+        if let avatarEmoji {
+            let normalized = avatarEmoji.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !normalized.isEmpty {
+                return normalized
+            }
+        }
+        return primaryRole.defaultAvatarEmoji
     }
 }
 

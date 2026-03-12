@@ -426,13 +426,26 @@ public actor MeetingOrchestrator {
             }
         }
 
-        return try nextRoundRobinSpeakerAlias(state: &state, meetingID: meetingID)
+        return try nextRoundRobinSpeakerAlias(state: &state, meeting: meeting, meetingID: meetingID)
     }
 
-    private func nextRoundRobinSpeakerAlias(state: inout RoomState, meetingID: UUID) throws -> String {
+    private func nextRoundRobinSpeakerAlias(state: inout RoomState, meeting: Meeting, meetingID: UUID) throws -> String {
         guard !state.speakerOrder.isEmpty else {
             throw MeetingOrchestratorError.noAgentParticipants(meetingID)
         }
+
+        if state.nextSpeakerIndex == 0 {
+            let aliasSet = Set(state.speakerOrder)
+            if let lastAgentAlias = meeting.messages.reversed().compactMap({ message in
+                let lowered = message.fromAlias.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                return aliasSet.contains(lowered) ? lowered : nil
+            }).first,
+               let lastIndex = state.speakerOrder.firstIndex(of: lastAgentAlias)
+            {
+                state.nextSpeakerIndex = (lastIndex + 1) % state.speakerOrder.count
+            }
+        }
+
         let index = state.nextSpeakerIndex % state.speakerOrder.count
         let alias = state.speakerOrder[index]
         state.nextSpeakerIndex = (index + 1) % state.speakerOrder.count

@@ -128,6 +128,7 @@ public struct Participant: Identifiable, Codable, Hashable, Sendable {
     public let id: UUID
     public var alias: String
     public var displayName: String
+    public var avatarEmoji: String?
     public var provider: String
     public var model: String
     public var roles: [ParticipantRole]
@@ -137,6 +138,7 @@ public struct Participant: Identifiable, Codable, Hashable, Sendable {
         id: UUID = UUID(),
         alias: String,
         displayName: String,
+        avatarEmoji: String? = nil,
         provider: String,
         model: String,
         roles: [ParticipantRole],
@@ -145,6 +147,12 @@ public struct Participant: Identifiable, Codable, Hashable, Sendable {
         self.id = id
         self.alias = alias
         self.displayName = displayName
+        let normalizedAvatar = avatarEmoji?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let normalizedAvatar, !normalizedAvatar.isEmpty {
+            self.avatarEmoji = normalizedAvatar
+        } else {
+            self.avatarEmoji = nil
+        }
         self.provider = provider
         self.model = model
         self.roles = Participant.normalizedRoles(from: roles)

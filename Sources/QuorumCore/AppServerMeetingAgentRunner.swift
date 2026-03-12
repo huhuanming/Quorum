@@ -531,6 +531,16 @@ private actor AppServerJSONRPCClient {
         }
 
         if let id = stringValue(dictionary["id"]) {
+            if let errorDict = dictionary["error"] as? [String: Any] {
+                let errorMessage = (errorDict["message"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "Unknown error"
+                emit(.diagnostic("rpc<- response id=\(id) error=\(errorMessage)"))
+            } else if let result = dictionary["result"] as? [String: Any] {
+                let summary = summarizeIncomingResponse(result: result)
+                emit(.diagnostic("rpc<- response id=\(id) result \(summary)"))
+            } else {
+                emit(.diagnostic("rpc<- response id=\(id) result {}"))
+            }
+
             guard let continuation = pendingResponses.removeValue(forKey: id) else {
                 return
             }
@@ -550,6 +560,7 @@ private actor AppServerJSONRPCClient {
 
         guard let method = dictionary["method"] as? String else { return }
         let params = dictionary["params"] as? [String: Any] ?? [:]
+        emit(.diagnostic("rpc<- notify method=\(method) \(summarizeIncomingNotification(method: method, params: params))"))
         await handleNotification(method: method, params: params)
     }
 
@@ -638,6 +649,8 @@ private actor AppServerJSONRPCClient {
         let requestID = String(nextRequestID)
         nextRequestID += 1
 
+        emit(.diagnostic("rpc-> request id=\(requestID) method=\(method) \(summarizeOutgoingRequest(method: method, params: params))"))
+
         try writeJSON([
             "jsonrpc": "2.0",
             "id": requestID,
@@ -665,6 +678,8 @@ private actor AppServerJSONRPCClient {
         if let params {
             payload["params"] = params
         }
+        let summary = params.map { summarizeOutgoingRequest(method: method, params: $0) } ?? ""
+        emit(.diagnostic("rpc-> notify method=\(method) \(summary)"))
         try writeJSON(payload)
     }
 
@@ -715,6 +730,104 @@ private actor AppServerJSONRPCClient {
             return status
         }
         return "\(status): \(errorMessage)"
+    }
+
+    private func summarizeOutgoingRequest(method: String, params: [String: Any]) -> String {
+        switch method {
+        case "thread/start":
+            let model = (params["model"] as? String) ?? "(default)"
+            let approval = (params["approvalPolicy"] as? String) ?? "(unset)"
+            let sandbox = (params["sandbox"] as? String) ?? "(unset)"
+            return "model=\(model) approval=\(approval) sandbox=\(sandbox)"
+        case "turn/start":
+            let threadID = (params["threadId"] as? String) ?? "(missing)"
+            let effort = (params["effort"] as? String) ?? "(default)"
+            let preview = previewTurnInput(params)
+            return "thread_id=\(threadID) effort=\(effort) input=\(preview)"
+        default:
+            return ""
+        }
+    }
+
+    private func summarizeIncomingResponse(result: [String: Any]) -> String {
+        if let thread = result["thread"] as? [String: Any],
+           let threadID = thread["id"] as? String
+        {
+            return "thread_id=\(threadID)"
+        }
+        if let turn = result["turn"] as? [String: Any],
+           let turnID = turn["id"] as? String
+        {
+            return "turn_id=\(turnID)"
+        }
+        if result.isEmpty {
+            return "{}"
+        }
+        return "keys=\(result.keys.sorted().joined(separator: ","))"
+    }
+
+    private func summarizeIncomingNotification(method: String, params: [String: Any]) -> String {
+        switch method {
+        case "thread/started":
+            if let thread = params["thread"] as? [String: Any],
+               let threadID = thread["id"] as? String
+            {
+                return "thread_id=\(threadID)"
+            }
+        case "turn/started":
+            if let turn = params["turn"] as? [String: Any],
+               let turnID = turn["id"] as? String
+            {
+                return "turn_id=\(turnID)"
+            }
+        case "turn/completed":
+            if let turn = params["turn"] as? [String: Any] {
+                let turnID = (turn["id"] as? String) ?? "(unknown)"
+                let status = (turn["status"] as? String) ?? "(unknown)"
+                return "turn_id=\(turnID) status=\(status)"
+            }
+        case "item/completed":
+            if let item = params["item"] as? [String: Any],
+               let type = item["type"] as? String
+            {
+                if type == "agentMessage" {
+                    let phase = (item["phase"] as? String) ?? "(none)"
+                    let text = (item["text"] as? String) ?? ""
+                    return "type=agentMessage phase=\(phase) text=\(preview(text, limit: 180))"
+                }
+                return "type=\(type)"
+            }
+        case "item/commandExecution/outputDelta":
+            if let delta = params["delta"] as? String {
+                return "delta=\(preview(delta, limit: 120))"
+            }
+        case "item/agentMessage/delta":
+            if let delta = params["delta"] as? String {
+                return "delta=\(preview(delta, limit: 120))"
+            }
+        default:
+            break
+        }
+        return ""
+    }
+
+    private func previewTurnInput(_ params: [String: Any]) -> String {
+        guard let input = params["input"] as? [Any],
+              let first = input.first as? [String: Any],
+              let text = first["text"] as? String
+        else {
+            return "(none)"
+        }
+        return preview(text, limit: 240)
+    }
+
+    private func preview(_ rawText: String, limit: Int) -> String {
+        let flattened = rawText.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard flattened.count > limit, limit > 0 else {
+            return flattened
+        }
+        let endIndex = flattened.index(flattened.startIndex, offsetBy: limit)
+        return String(flattened[..<endIndex]) + "..."
     }
 
     private func emit(_ event: AppServerEvent) {
