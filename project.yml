@@ -1,0 +1,50 @@
+name: Quorum
+options:
+  deploymentTarget:
+    macOS: "14.0"
+settings:
+  base:
+    SWIFT_VERSION: 6.0
+targets:
+  QuorumCore:
+    type: framework
+    platform: macOS
+    sources:
+      - Sources/QuorumCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.huhuanming.quorum.core
+        GENERATE_INFOPLIST_FILE: YES
+  quorum:
+    type: tool
+    platform: macOS
+    sources:
+      - Sources/QuorumCLI
+    dependencies:
+      - target: QuorumCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.huhuanming.quorum.cli
+        GENERATE_INFOPLIST_FILE: YES
+  QuorumApp:
+    type: application
+    platform: macOS
+    sources:
+      - Sources/QuorumApp
+    dependencies:
+      - target: QuorumCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.huhuanming.quorum.app
+        GENERATE_INFOPLIST_FILE: YES
+  QuorumCoreTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - Tests/QuorumCoreTests
+    dependencies:
+      - target: QuorumCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.huhuanming.quorum.tests
+        GENERATE_INFOPLIST_FILE: YES
