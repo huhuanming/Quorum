@@ -22,18 +22,30 @@ public struct AgentTurnContext: Sendable {
     }
 }
 
+public struct AgentReplyOutput: Sendable {
+    public var content: String
+    public var status: String
+    public var diagnostics: [String]
+
+    public init(content: String, status: String = "completed", diagnostics: [String] = []) {
+        self.content = content
+        self.status = status
+        self.diagnostics = diagnostics
+    }
+}
+
 public struct MeetingAgentClient: Sendable {
     public var alias: String
     public var provider: String
     public var model: String
-    private let generateReplyClosure: @Sendable (AgentTurnContext) async throws -> String
+    private let generateReplyClosure: @Sendable (AgentTurnContext) async throws -> AgentReplyOutput
     private let shutdownClosure: @Sendable () async -> Void
 
     public init(
         alias: String,
         provider: String,
         model: String,
-        generateReply: @escaping @Sendable (AgentTurnContext) async throws -> String,
+        generateReply: @escaping @Sendable (AgentTurnContext) async throws -> AgentReplyOutput,
         shutdown: @escaping @Sendable () async -> Void
     ) {
         self.alias = alias
@@ -43,7 +55,7 @@ public struct MeetingAgentClient: Sendable {
         self.shutdownClosure = shutdown
     }
 
-    public func generateReply(context: AgentTurnContext) async throws -> String {
+    public func generateReply(context: AgentTurnContext) async throws -> AgentReplyOutput {
         try await generateReplyClosure(context)
     }
 
@@ -149,9 +161,54 @@ public actor MeetingOrchestrator {
         }
 
         let context = buildContext(meeting: meeting, participant: participant)
-        let rawReply = try await client.generateReply(context: context)
-        let reply = rawReply.trimmingCharacters(in: .whitespacesAndNewlines)
+        let startLog = AgentExecutionLog(
+            participantAlias: participant.alias,
+            participantDisplayName: participant.displayName,
+            participantRole: participant.primaryRole,
+            provider: participant.provider,
+            model: participant.model,
+            prompt: context.prompt,
+            response: "",
+            status: "running",
+            diagnostics: ["agent turn started"],
+            createdAt: now()
+        )
+        _ = try? await runtime.recordExecutionLog(meetingID: meetingID, log: startLog)
+
+        let output: AgentReplyOutput
+        do {
+            output = try await client.generateReply(context: context)
+        } catch {
+            let failedLog = AgentExecutionLog(
+                participantAlias: participant.alias,
+                participantDisplayName: participant.displayName,
+                participantRole: participant.primaryRole,
+                provider: participant.provider,
+                model: participant.model,
+                prompt: context.prompt,
+                response: "",
+                status: "failed",
+                diagnostics: ["error=\(error.localizedDescription)"],
+                createdAt: now()
+            )
+            _ = try? await runtime.recordExecutionLog(meetingID: meetingID, log: failedLog)
+            throw error
+        }
+        let reply = output.content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !reply.isEmpty else {
+            let emptyLog = AgentExecutionLog(
+                participantAlias: participant.alias,
+                participantDisplayName: participant.displayName,
+                participantRole: participant.primaryRole,
+                provider: participant.provider,
+                model: participant.model,
+                prompt: context.prompt,
+                response: output.content,
+                status: "\(output.status): empty_reply",
+                diagnostics: output.diagnostics,
+                createdAt: now()
+            )
+            _ = try? await runtime.recordExecutionLog(meetingID: meetingID, log: emptyLog)
             throw MeetingOrchestratorError.emptyAgentReply(participant.alias)
         }
 
@@ -162,6 +219,19 @@ public actor MeetingOrchestrator {
             content: reply,
             activeRole: participant.primaryRole
         )
+        let executionLog = AgentExecutionLog(
+            participantAlias: participant.alias,
+            participantDisplayName: participant.displayName,
+            participantRole: participant.primaryRole,
+            provider: participant.provider,
+            model: participant.model,
+            prompt: context.prompt,
+            response: reply,
+            status: output.status,
+            diagnostics: output.diagnostics,
+            createdAt: now()
+        )
+        _ = try? await runtime.recordExecutionLog(meetingID: meetingID, log: executionLog)
 
         if participant.roles.contains(.judge),
            meeting.policy.judgeAutoDecision,
@@ -228,6 +298,10 @@ public actor MeetingOrchestrator {
 
     public func autopilotEnabled(meetingID: UUID) -> Bool {
         rooms[meetingID]?.autopilotTask != nil
+    }
+
+    public func removeMeeting(meetingID: UUID) async {
+        await stopRoom(roomID: meetingID)
     }
 
     public func stopAll() async {
@@ -397,6 +471,33 @@ public actor MeetingOrchestrator {
         lines.append("Your model: \(participant.model)")
         let participantRoles = participant.roles.map(\.rawValue).joined(separator: ", ")
         lines.append("Your roles: \(participantRoles)")
+
+        lines.append("Meeting default skill:")
+        if let defaultSkill = meeting.defaultSkill {
+            lines.append("- \(defaultSkill.name)")
+            lines.append(defaultSkill.content)
+        } else {
+            lines.append("- (none)")
+        }
+
+        lines.append("Meeting additional skills:")
+        if meeting.additionalSkills.isEmpty {
+            lines.append("- (none)")
+        } else {
+            for skill in meeting.additionalSkills {
+                lines.append("- \(skill.name)")
+                lines.append(skill.content)
+            }
+        }
+
+        lines.append("Your initial skill:")
+        if let initialSkill = participant.initialSkill {
+            lines.append("- \(initialSkill.name)")
+            lines.append(initialSkill.content)
+        } else {
+            lines.append("- (none)")
+        }
+
         lines.append("Participants:")
         for member in meeting.participants {
             let memberRoles = member.roles.map(\.rawValue).joined(separator: ",")
@@ -408,8 +509,8 @@ public actor MeetingOrchestrator {
             lines.append("- (none)")
         } else {
             for message in recentMessages {
-                let role = message.activeRole?.rawValue ?? "n/a"
-                lines.append("- [\(message.createdAt.ISO8601Format())] @\(message.fromAlias) role=\(role): \(message.content)")
+                let utterance = quotedUtterance(for: message, in: meeting)
+                lines.append("- [\(message.createdAt.ISO8601Format())] \(utterance)")
             }
         }
 
@@ -424,10 +525,26 @@ public actor MeetingOrchestrator {
 
         lines.append("Instruction:")
         lines.append("- Reply with one concise meeting message in your role.")
+        lines.append("- The conversation transcript format is strict: 「角色名称」：「说话」.")
         lines.append("- If you are acting as judge and the meeting can end, include exactly one decision marker:")
         lines.append("  decision: continue | decision: converge | decision: terminate")
         lines.append("- Do not include markdown fences.")
         return lines.joined(separator: "\n")
+    }
+
+    private func quotedUtterance(for message: MeetingMessage, in meeting: Meeting) -> String {
+        let roleTitle: String
+        if let role = message.activeRole {
+            roleTitle = role.roleTitle
+        } else if let participant = meeting.participants.first(where: {
+            $0.alias.caseInsensitiveCompare(message.fromAlias) == .orderedSame
+        }) {
+            roleTitle = participant.primaryRole.roleTitle
+        } else {
+            roleTitle = "发言人"
+        }
+        let normalizedSpeech = message.content.replacingOccurrences(of: "\n", with: " ").trimmingCharacters(in: .whitespacesAndNewlines)
+        return "「\(roleTitle)」：「\(normalizedSpeech)」"
     }
 
     private func parseJudgeDecision(_ text: String) -> MeetingJudgeDecision? {
@@ -442,5 +559,22 @@ public actor MeetingOrchestrator {
             return .continue
         }
         return nil
+    }
+}
+
+private extension ParticipantRole {
+    var roleTitle: String {
+        switch self {
+        case .host:
+            return "主持人"
+        case .planner:
+            return "规划师"
+        case .reviewer:
+            return "评审员"
+        case .judge:
+            return "裁判"
+        case .observer:
+            return "观察员"
+        }
     }
 }

@@ -38,12 +38,19 @@ public actor MeetingRuntime {
     }
 
     @discardableResult
-    public func createMeeting(title: String, goal: String = "") -> Meeting {
+    public func createMeeting(
+        title: String,
+        goal: String = "",
+        defaultSkill: MeetingSkillDocument? = nil,
+        additionalSkills: [MeetingSkillDocument] = []
+    ) -> Meeting {
         let meeting = Meeting(
             title: title,
             goal: goal,
             createdAt: now(),
-            phase: .lobby
+            phase: .lobby,
+            defaultSkill: defaultSkill,
+            additionalSkills: additionalSkills
         )
         meetings[meeting.id] = meeting
         persistSnapshot()
@@ -64,6 +71,15 @@ public actor MeetingRuntime {
             throw MeetingRuntimeError.meetingNotFound(id)
         }
         return meeting
+    }
+
+    @discardableResult
+    public func deleteMeeting(id: UUID) throws -> Meeting {
+        guard let deleted = meetings.removeValue(forKey: id) else {
+            throw MeetingRuntimeError.meetingNotFound(id)
+        }
+        persistSnapshot()
+        return deleted
     }
 
     @discardableResult
@@ -139,6 +155,28 @@ public actor MeetingRuntime {
         meetings[meetingID] = meeting
         persistSnapshot()
         return message
+    }
+
+    @discardableResult
+    public func deleteMessage(meetingID: UUID, messageID: UUID) throws -> MeetingMessage {
+        var meeting = try resolveMeeting(meetingID)
+        guard let index = meeting.messages.firstIndex(where: { $0.id == messageID }) else {
+            throw MeetingRuntimeError.messageNotFound(messageID)
+        }
+
+        let deleted = meeting.messages.remove(at: index)
+        meetings[meetingID] = meeting
+        persistSnapshot()
+        return deleted
+    }
+
+    @discardableResult
+    public func recordExecutionLog(meetingID: UUID, log: AgentExecutionLog) throws -> Meeting {
+        var meeting = try resolveMeeting(meetingID)
+        meeting.executionLogs.append(log)
+        meetings[meetingID] = meeting
+        persistSnapshot()
+        return meeting
     }
 
     @discardableResult
@@ -232,6 +270,21 @@ public actor MeetingRuntime {
         for participant in meeting.participants {
             let roles = participant.roles.map(\.rawValue).joined(separator: ",")
             lines.append("- \(participant.displayName) (@\(participant.alias)) [\(participant.provider)/\(participant.model)] roles=\(roles)")
+        }
+
+        lines.append("")
+        lines.append("## Skills")
+        if let defaultSkill = meeting.defaultSkill {
+            lines.append("- default: \(defaultSkill.name)")
+        } else {
+            lines.append("- default: (none)")
+        }
+        if meeting.additionalSkills.isEmpty {
+            lines.append("- additional: (none)")
+        } else {
+            for skill in meeting.additionalSkills {
+                lines.append("- additional: \(skill.name)")
+            }
         }
 
         lines.append("")

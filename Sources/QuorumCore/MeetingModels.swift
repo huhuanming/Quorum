@@ -32,6 +32,74 @@ public enum MeetingAttachmentKind: String, Codable, CaseIterable, Sendable {
     case image
 }
 
+public enum MeetingSkillSource: String, Codable, CaseIterable, Sendable {
+    case builtIn
+    case imported
+    case custom
+}
+
+public struct MeetingSkillDocument: Identifiable, Codable, Hashable, Sendable {
+    public let id: UUID
+    public var name: String
+    public var content: String
+    public var source: MeetingSkillSource
+    public var filePath: String?
+
+    public init(
+        id: UUID = UUID(),
+        name: String,
+        content: String,
+        source: MeetingSkillSource = .custom,
+        filePath: String? = nil
+    ) {
+        self.id = id
+        self.name = name
+        self.content = content
+        self.source = source
+        self.filePath = filePath
+    }
+}
+
+public struct AgentExecutionLog: Identifiable, Codable, Hashable, Sendable {
+    public let id: UUID
+    public var participantAlias: String
+    public var participantDisplayName: String
+    public var participantRole: ParticipantRole
+    public var provider: String
+    public var model: String
+    public var prompt: String
+    public var response: String
+    public var status: String
+    public var diagnostics: [String]
+    public var createdAt: Date
+
+    public init(
+        id: UUID = UUID(),
+        participantAlias: String,
+        participantDisplayName: String,
+        participantRole: ParticipantRole,
+        provider: String,
+        model: String,
+        prompt: String,
+        response: String,
+        status: String,
+        diagnostics: [String] = [],
+        createdAt: Date = Date()
+    ) {
+        self.id = id
+        self.participantAlias = participantAlias
+        self.participantDisplayName = participantDisplayName
+        self.participantRole = participantRole
+        self.provider = provider
+        self.model = model
+        self.prompt = prompt
+        self.response = response
+        self.status = status
+        self.diagnostics = diagnostics
+        self.createdAt = createdAt
+    }
+}
+
 public enum MeetingSpeakingMode: String, Codable, CaseIterable, Sendable {
     case roundRobin
     case judgeGated
@@ -63,6 +131,7 @@ public struct Participant: Identifiable, Codable, Hashable, Sendable {
     public var provider: String
     public var model: String
     public var roles: [ParticipantRole]
+    public var initialSkill: MeetingSkillDocument?
 
     public init(
         id: UUID = UUID(),
@@ -70,7 +139,8 @@ public struct Participant: Identifiable, Codable, Hashable, Sendable {
         displayName: String,
         provider: String,
         model: String,
-        roles: [ParticipantRole]
+        roles: [ParticipantRole],
+        initialSkill: MeetingSkillDocument? = nil
     ) {
         self.id = id
         self.alias = alias
@@ -78,6 +148,7 @@ public struct Participant: Identifiable, Codable, Hashable, Sendable {
         self.provider = provider
         self.model = model
         self.roles = Participant.normalizedRoles(from: roles)
+        self.initialSkill = initialSkill
     }
 
     public var primaryRole: ParticipantRole {
@@ -152,6 +223,9 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
     public var messages: [MeetingMessage]
     public var attachments: [MeetingAttachment]
     public var policy: MeetingPolicy
+    public var defaultSkill: MeetingSkillDocument?
+    public var additionalSkills: [MeetingSkillDocument]
+    public var executionLogs: [AgentExecutionLog]
     public var judgeDecision: MeetingJudgeDecision?
     public var terminationReason: MeetingTerminationReason?
 
@@ -167,6 +241,9 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
         messages: [MeetingMessage] = [],
         attachments: [MeetingAttachment] = [],
         policy: MeetingPolicy = .default,
+        defaultSkill: MeetingSkillDocument? = nil,
+        additionalSkills: [MeetingSkillDocument] = [],
+        executionLogs: [AgentExecutionLog] = [],
         judgeDecision: MeetingJudgeDecision? = nil,
         terminationReason: MeetingTerminationReason? = nil
     ) {
@@ -181,6 +258,9 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
         self.messages = messages
         self.attachments = attachments
         self.policy = policy
+        self.defaultSkill = defaultSkill
+        self.additionalSkills = additionalSkills
+        self.executionLogs = executionLogs
         self.judgeDecision = judgeDecision
         self.terminationReason = terminationReason
     }
@@ -197,6 +277,9 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
         case messages
         case attachments
         case policy
+        case defaultSkill
+        case additionalSkills
+        case executionLogs
         case judgeDecision
         case terminationReason
     }
@@ -214,6 +297,9 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
         messages = try container.decodeIfPresent([MeetingMessage].self, forKey: .messages) ?? []
         attachments = try container.decodeIfPresent([MeetingAttachment].self, forKey: .attachments) ?? []
         policy = try container.decodeIfPresent(MeetingPolicy.self, forKey: .policy) ?? .default
+        defaultSkill = try container.decodeIfPresent(MeetingSkillDocument.self, forKey: .defaultSkill)
+        additionalSkills = try container.decodeIfPresent([MeetingSkillDocument].self, forKey: .additionalSkills) ?? []
+        executionLogs = try container.decodeIfPresent([AgentExecutionLog].self, forKey: .executionLogs) ?? []
         judgeDecision = try container.decodeIfPresent(MeetingJudgeDecision.self, forKey: .judgeDecision)
         terminationReason = try container.decodeIfPresent(MeetingTerminationReason.self, forKey: .terminationReason)
     }
@@ -231,6 +317,9 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
         try container.encode(messages, forKey: .messages)
         try container.encode(attachments, forKey: .attachments)
         try container.encode(policy, forKey: .policy)
+        try container.encodeIfPresent(defaultSkill, forKey: .defaultSkill)
+        try container.encode(additionalSkills, forKey: .additionalSkills)
+        try container.encode(executionLogs, forKey: .executionLogs)
         try container.encodeIfPresent(judgeDecision, forKey: .judgeDecision)
         try container.encodeIfPresent(terminationReason, forKey: .terminationReason)
     }
@@ -238,6 +327,7 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
 
 public enum MeetingRuntimeError: Error, Equatable, Sendable {
     case meetingNotFound(UUID)
+    case messageNotFound(UUID)
     case aliasAlreadyExists(String)
     case participantCountOutOfRange(actual: Int, allowed: ClosedRange<Int>)
     case meetingNotRunning(UUID)
@@ -253,6 +343,8 @@ extension MeetingRuntimeError: LocalizedError {
         switch self {
         case .meetingNotFound(let id):
             return "Meeting not found: \(id.uuidString.lowercased())"
+        case .messageNotFound(let id):
+            return "Message not found: \(id.uuidString.lowercased())"
         case .aliasAlreadyExists(let alias):
             return "Alias already exists in meeting: \(alias)"
         case .participantCountOutOfRange(let actual, let allowed):

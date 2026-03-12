@@ -32,7 +32,7 @@ struct ResolvedAgentExecutable: Sendable {
 }
 
 enum AppServerMeetingAgentRunner {
-    static func run(participant: Participant, context: AgentTurnContext) async throws -> String {
+    static func run(participant: Participant, context: AgentTurnContext) async throws -> AgentReplyOutput {
         let provider = participant.provider.lowercased()
         guard provider != "human" else {
             throw AppServerMeetingAgentRunnerError.providerNotSupported(provider)
@@ -40,7 +40,11 @@ enum AppServerMeetingAgentRunner {
 
         guard let resolved = resolveExecutable(for: provider) else {
             // Fallback to an explicit message so meeting flow still works even when local adapter is missing.
-            return "[\(participant.alias)] agent executable missing for provider '\(provider)'. Configure env and retry."
+            return AgentReplyOutput(
+                content: "[\(participant.alias)] agent executable missing for provider '\(provider)'. Configure env and retry.",
+                status: "failed: executable_missing",
+                diagnostics: ["provider=\(provider) executable_source=missing"]
+            )
         }
 
         let cwd = FileManager.default.currentDirectoryPath
@@ -55,18 +59,18 @@ enum AppServerMeetingAgentRunner {
                 if phase == "final_answer" {
                     await accumulator.setFinalAnswer(text)
                 }
-            case .commandOutputDelta(_, _):
-                break
-            case .diagnostic(_):
-                break
-            case .turnCompleted(_, _):
-                break
-            case .turnStarted(_):
-                break
-            case .threadStarted(_):
-                break
-            case .processTerminated(_):
-                break
+            case .commandOutputDelta(_, let delta):
+                await accumulator.appendDiagnostic("command-output: \(delta)")
+            case .diagnostic(let message):
+                await accumulator.appendDiagnostic(message)
+            case .turnCompleted(let turnId, let status):
+                await accumulator.appendDiagnostic("turn-completed turn_id=\(turnId) status=\(status)")
+            case .turnStarted(let turnId):
+                await accumulator.appendDiagnostic("turn-started turn_id=\(turnId)")
+            case .threadStarted(let threadId):
+                await accumulator.appendDiagnostic("thread-started thread_id=\(threadId)")
+            case .processTerminated(let exitCode):
+                await accumulator.appendDiagnostic("process-terminated exit_code=\(exitCode)")
             }
         }
 
@@ -79,10 +83,21 @@ enum AppServerMeetingAgentRunner {
                 approvalPolicy: "never",
                 sandbox: "danger-full-access"
             )
-            let turnID = try await client.startTurn(threadId: threadID, input: context.prompt)
-            let status = try await waitTurnWithTimeout(client: client, turnID: turnID, timeoutSeconds: 120)
+            let turnID = try await client.startTurn(
+                threadId: threadID,
+                input: context.prompt,
+                effort: preferredReasoningEffort(for: participant)
+            )
+            let status = try await waitTurnWithTimeout(
+                client: client,
+                turnID: turnID,
+                alias: participant.alias,
+                timeoutSeconds: 45
+            )
             let outputBuffer = await accumulator.buffer
             let finalAnswer = await accumulator.finalAnswer
+            var diagnostics = await accumulator.diagnostics
+            diagnostics.insert("provider=\(provider) executable=\(resolved.executable) source=\(resolved.source)", at: 0)
             await client.shutdown()
 
             guard status == "completed" else {
@@ -91,23 +106,31 @@ enum AppServerMeetingAgentRunner {
 
             let trimmedFinal = finalAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmedFinal.isEmpty {
-                return trimmedFinal
+                return AgentReplyOutput(content: trimmedFinal, status: status, diagnostics: diagnostics)
             }
             let trimmedBuffer = outputBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmedBuffer.isEmpty else {
                 throw AppServerMeetingAgentRunnerError.emptyResponse(participant.alias)
             }
-            return trimmedBuffer
+            return AgentReplyOutput(content: trimmedBuffer, status: status, diagnostics: diagnostics)
         } catch {
+            var diagnostics = await accumulator.diagnostics
+            diagnostics.insert("provider=\(provider) executable=\(resolved.executable) source=\(resolved.source)", at: 0)
+            diagnostics.append("error=\(error.localizedDescription)")
             await client.shutdown()
             // Degrade gracefully instead of breaking the whole room.
-            return "[\(participant.alias)] agent execution failed: \(error.localizedDescription)"
+            return AgentReplyOutput(
+                content: "[\(participant.alias)] agent execution failed: \(error.localizedDescription)",
+                status: "failed",
+                diagnostics: diagnostics
+            )
         }
     }
 
     private static func waitTurnWithTimeout(
         client: AppServerJSONRPCClient,
         turnID: String,
+        alias: String,
         timeoutSeconds: TimeInterval
     ) async throws -> String {
         try await withThrowingTaskGroup(of: String.self) { group in
@@ -116,7 +139,7 @@ enum AppServerMeetingAgentRunner {
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                throw AppServerMeetingAgentRunnerError.timedOut(turnID)
+                throw AppServerMeetingAgentRunnerError.timedOut(alias)
             }
 
             guard let first = try await group.next() else {
@@ -125,6 +148,14 @@ enum AppServerMeetingAgentRunner {
             group.cancelAll()
             return first
         }
+    }
+
+    private static func preferredReasoningEffort(for participant: Participant) -> String? {
+        guard participant.provider.caseInsensitiveCompare("codex") == .orderedSame else {
+            return nil
+        }
+        // ChatGPT-backed codex sessions can default to xhigh, which fails on some models (for example gpt-5).
+        return "high"
     }
 
     private static func buildDeveloperInstructions(for participant: Participant) -> String {
@@ -234,6 +265,7 @@ private enum AppServerEvent: Sendable {
 private actor AppServerStreamAccumulator {
     var buffer: String = ""
     var finalAnswer: String = ""
+    var diagnostics: [String] = []
 
     func appendDelta(_ delta: String) {
         buffer += delta
@@ -241,6 +273,10 @@ private actor AppServerStreamAccumulator {
 
     func setFinalAnswer(_ text: String) {
         finalAnswer = text
+    }
+
+    func appendDiagnostic(_ text: String) {
+        diagnostics.append(text)
     }
 }
 
@@ -363,18 +399,23 @@ private actor AppServerJSONRPCClient {
         return threadID
     }
 
-    func startTurn(threadId: String, input: String) async throws -> String {
+    func startTurn(threadId: String, input: String, effort: String? = nil) async throws -> String {
+        var params: [String: Any] = [
+            "threadId": threadId,
+            "input": [
+                [
+                    "type": "text",
+                    "text": input,
+                ],
+            ],
+        ]
+        if let effort, !effort.isEmpty {
+            params["effort"] = effort
+        }
+
         let result = try await sendRequest(
             method: "turn/start",
-            params: [
-                "threadId": threadId,
-                "input": [
-                    [
-                        "type": "text",
-                        "text": input,
-                    ],
-                ],
-            ]
+            params: params
         )
         guard let turn = result["turn"] as? [String: Any],
               let turnID = turn["id"] as? String
@@ -533,12 +574,14 @@ private actor AppServerJSONRPCClient {
                let turnID = turn["id"] as? String,
                let status = turn["status"] as? String
             {
+                let errorMessage = turnErrorMessage(from: turn["error"])
+                let completionStatus = statusWithError(status: status, errorMessage: errorMessage)
                 if let continuation = pendingTurnCompletions.removeValue(forKey: turnID) {
-                    continuation.resume(returning: status)
+                    continuation.resume(returning: completionStatus)
                 } else {
-                    completedTurns[turnID] = status
+                    completedTurns[turnID] = completionStatus
                 }
-                emit(.turnCompleted(turnId: turnID, status: status))
+                emit(.turnCompleted(turnId: turnID, status: completionStatus))
             }
 
         case "item/agentMessage/delta":
@@ -636,6 +679,42 @@ private actor AppServerJSONRPCClient {
         if let value = value as? String { return value }
         if let value = value as? NSNumber { return value.stringValue }
         return nil
+    }
+
+    private func turnErrorMessage(from value: Any?) -> String? {
+        if let message = value as? String {
+            let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+
+        guard let dictionary = value as? [String: Any] else {
+            return nil
+        }
+        if let message = dictionary["message"] as? String {
+            let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        if let details = dictionary["details"] as? String {
+            let trimmed = details.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty {
+                return trimmed
+            }
+        }
+        if let serialized = try? JSONSerialization.data(withJSONObject: dictionary, options: []),
+           let text = String(data: serialized, encoding: .utf8)
+        {
+            return text
+        }
+        return nil
+    }
+
+    private func statusWithError(status: String, errorMessage: String?) -> String {
+        guard status != "completed", let errorMessage, !errorMessage.isEmpty else {
+            return status
+        }
+        return "\(status): \(errorMessage)"
     }
 
     private func emit(_ event: AppServerEvent) {
