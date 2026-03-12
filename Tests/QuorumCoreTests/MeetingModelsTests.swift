@@ -206,6 +206,46 @@ func defaultPolicyAndClamp() async throws {
     #expect(updated.policy.maxConcurrentAgents == 1)
 }
 
+@Test("Message deletion removes item and reports missing message")
+func messageDeletion() async throws {
+    let runtime = makeRuntime()
+    let meeting = await runtime.createMeeting(title: "Delete Message", goal: "cleanup")
+
+    _ = try await runtime.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "me", displayName: "You", provider: "human", model: "human", roles: [.host, .judge])
+    )
+    _ = try await runtime.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "claude-a", displayName: "Claude", provider: "claude", model: "claude-sonnet", roles: [.planner])
+    )
+    _ = try await runtime.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "codex-r1", displayName: "Codex", provider: "codex", model: "gpt-5", roles: [.reviewer])
+    )
+    _ = try await runtime.startMeeting(id: meeting.id)
+
+    let message = try await runtime.postMessage(
+        meetingID: meeting.id,
+        fromAlias: "me",
+        toAliases: ["all"],
+        content: "这条消息会被删除"
+    )
+
+    let deleted = try await runtime.deleteMessage(meetingID: meeting.id, messageID: message.id)
+    #expect(deleted.id == message.id)
+
+    let latest = try await runtime.meeting(id: meeting.id)
+    #expect(latest.messages.isEmpty)
+
+    do {
+        _ = try await runtime.deleteMessage(meetingID: meeting.id, messageID: message.id)
+        Issue.record("Expected deleting missing message to fail")
+    } catch let error as MeetingRuntimeError {
+        #expect(error == .messageNotFound(message.id))
+    }
+}
+
 private func makeRuntime() -> MeetingRuntime {
     MeetingRuntime(databaseURL: temporaryDatabaseURL())
 }
