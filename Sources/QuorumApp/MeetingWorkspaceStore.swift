@@ -56,6 +56,8 @@ final class MeetingWorkspaceStore {
         title: String,
         goal: String,
         participants: [Participant],
+        defaultSkill: MeetingSkillDocument? = nil,
+        additionalSkills: [MeetingSkillDocument] = [],
         policy: MeetingPolicy,
         autoStart: Bool
     ) async throws -> UUID {
@@ -68,7 +70,12 @@ final class MeetingWorkspaceStore {
             )
         }
 
-        let created = await runtime.createMeeting(title: normalizedTitle, goal: goal)
+        let created = await runtime.createMeeting(
+            title: normalizedTitle,
+            goal: goal,
+            defaultSkill: defaultSkill,
+            additionalSkills: additionalSkills
+        )
         do {
             for participant in participants {
                 _ = try await runtime.addParticipant(meetingID: created.id, participant: participant)
@@ -130,6 +137,7 @@ final class MeetingWorkspaceStore {
                 await refreshSnapshot()
                 setActionStatus("已执行一轮")
             } catch {
+                await refreshSnapshot()
                 setError(error.localizedDescription)
             }
         }
@@ -162,10 +170,28 @@ final class MeetingWorkspaceStore {
         return updated
     }
 
+    func deleteMeeting(_ meetingID: UUID) {
+        Task {
+            do {
+                try? await orchestrator.setAutopilot(meetingID: meetingID, enabled: false)
+                await orchestrator.removeMeeting(meetingID: meetingID)
+                _ = try await runtime.deleteMeeting(id: meetingID)
+                await refreshSnapshot()
+                setActionStatus("会议已删除")
+            } catch {
+                setError(error.localizedDescription)
+            }
+        }
+    }
+
     func sendDraftMessage() {
         guard let meeting = activeMeeting else { return }
         let content = draftMessage.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !content.isEmpty else { return }
+        let activeRole = meeting.participants.first(where: {
+            $0.alias.caseInsensitiveCompare(selfAlias) == .orderedSame
+        })?.primaryRole
+        let shouldTriggerAgent = meeting.phase == .running
 
         draftMessage = ""
         Task {
@@ -174,9 +200,32 @@ final class MeetingWorkspaceStore {
                     meetingID: meeting.id,
                     fromAlias: selfAlias,
                     toAliases: ["all"],
-                    content: content
+                    content: content,
+                    activeRole: activeRole
                 )
+
+                if shouldTriggerAgent {
+                    let autopilotEnabled = await orchestrator.autopilotEnabled(meetingID: meeting.id)
+                    if !autopilotEnabled {
+                        _ = try await orchestrator.tick(meetingID: meeting.id)
+                        setActionStatus("已发送并触发一轮 Agent")
+                    }
+                }
+
                 await refreshSnapshot()
+            } catch {
+                await refreshSnapshot()
+                setError(error.localizedDescription)
+            }
+        }
+    }
+
+    func deleteMessage(meetingID: UUID, messageID: UUID) {
+        Task {
+            do {
+                _ = try await runtime.deleteMessage(meetingID: meetingID, messageID: messageID)
+                await refreshSnapshot()
+                setActionStatus("消息已删除")
             } catch {
                 setError(error.localizedDescription)
             }
@@ -243,10 +292,13 @@ final class MeetingWorkspaceStore {
         meetings = latest
         autopilotByRoom = latestAutopilot
 
-        if let activeMeetingID {
+        if let activeMeetingID, latest.contains(where: { $0.id == activeMeetingID }) {
             unreadByRoom[activeMeetingID] = 0
         } else if let first = latest.first {
             activeMeetingID = first.id
+            unreadByRoom[first.id] = 0
+        } else {
+            self.activeMeetingID = nil
         }
     }
 
@@ -258,6 +310,10 @@ final class MeetingWorkspaceStore {
 
     func clearError() {
         lastError = nil
+    }
+
+    func showActionStatus(_ message: String) {
+        setActionStatus(message)
     }
 
     private func setActionStatus(_ message: String) {
