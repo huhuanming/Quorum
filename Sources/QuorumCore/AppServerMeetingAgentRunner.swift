@@ -63,44 +63,68 @@ enum AppServerMeetingAgentRunner {
                 )
             }
 
-            let accumulator = AppServerStreamAccumulator()
+            let maxAttempts = 3
+            var recentDiagnostics: [String] = []
 
-            do {
-                let client = try await ensureConnectedClient(executable: resolved.executable)
-                await client.setEventHandler { event in
-                    await AppServerMeetingAgentRunner.forward(event: event, to: accumulator)
+            for attempt in 1 ... maxAttempts {
+                let accumulator = AppServerStreamAccumulator()
+                do {
+                    let client = try await ensureConnectedClient(executable: resolved.executable)
+                    guard await client.isProcessRunning() else {
+                        throw AppServerJSONRPCClientError.processNotRunning
+                    }
+                    await client.setEventHandler { event in
+                        await AppServerMeetingAgentRunner.forward(event: event, to: accumulator)
+                    }
+
+                    let threadID = try await ensureThreadID(client: client)
+                    let turnID = try await client.startTurn(
+                        threadId: threadID,
+                        input: context.prompt,
+                        effort: AppServerMeetingAgentRunner.preferredReasoningEffort(for: participant)
+                    )
+                    let status = try await AppServerMeetingAgentRunner.waitTurnWithTimeout(
+                        client: client,
+                        turnID: turnID,
+                        alias: participant.alias,
+                        timeoutSeconds: 45
+                    )
+                    return try await AppServerMeetingAgentRunner.buildOutput(
+                        participant: participant,
+                        provider: provider,
+                        resolved: resolved,
+                        status: status,
+                        accumulator: accumulator
+                    )
+                } catch {
+                    let attemptDiagnostics = await accumulator.diagnostics
+                    recentDiagnostics.append(contentsOf: attemptDiagnostics)
+                    recentDiagnostics.append("attempt=\(attempt) error=\(error.localizedDescription)")
+                    let recoverable = AppServerMeetingAgentRunner.shouldRetry(error: error)
+                    await resetTransport()
+                    if recoverable && attempt < maxAttempts {
+                        let backoffMs = 200 * Int(pow(2.0, Double(attempt - 1)))
+                        recentDiagnostics.append("attempt=\(attempt) retry_in_ms=\(backoffMs)")
+                        try? await Task.sleep(nanoseconds: UInt64(backoffMs) * 1_000_000)
+                        continue
+                    }
+
+                    var diagnostics = recentDiagnostics
+                    diagnostics.insert("provider=\(provider) executable=\(resolved.executable) source=\(resolved.source)", at: 0)
+                    diagnostics.append("error=\(error.localizedDescription)")
+                    return AgentReplyOutput(
+                        content: "[\(participant.alias)] agent execution failed: \(error.localizedDescription)",
+                        status: "failed",
+                        diagnostics: diagnostics
+                    )
                 }
-
-                let threadID = try await ensureThreadID(client: client)
-                let turnID = try await client.startTurn(
-                    threadId: threadID,
-                    input: context.prompt,
-                    effort: AppServerMeetingAgentRunner.preferredReasoningEffort(for: participant)
-                )
-                let status = try await AppServerMeetingAgentRunner.waitTurnWithTimeout(
-                    client: client,
-                    turnID: turnID,
-                    alias: participant.alias,
-                    timeoutSeconds: 45
-                )
-                return try await AppServerMeetingAgentRunner.buildOutput(
-                    participant: participant,
-                    provider: provider,
-                    resolved: resolved,
-                    status: status,
-                    accumulator: accumulator
-                )
-            } catch {
-                var diagnostics = await accumulator.diagnostics
-                diagnostics.insert("provider=\(provider) executable=\(resolved.executable) source=\(resolved.source)", at: 0)
-                diagnostics.append("error=\(error.localizedDescription)")
-                await resetTransport()
-                return AgentReplyOutput(
-                    content: "[\(participant.alias)] agent execution failed: \(error.localizedDescription)",
-                    status: "failed",
-                    diagnostics: diagnostics
-                )
             }
+
+            return AgentReplyOutput(
+                content: "[\(participant.alias)] agent execution failed: retry attempts exhausted",
+                status: "failed",
+                diagnostics: ["provider=\(provider) executable=\(resolved.executable) source=\(resolved.source)"]
+            )
         }
 
         func shutdown() async {
@@ -224,6 +248,32 @@ enum AppServerMeetingAgentRunner {
         }
     }
 
+    private static func shouldRetry(error: Error) -> Bool {
+        if let runnerError = error as? AppServerMeetingAgentRunnerError {
+            switch runnerError {
+            case .timedOut, .turnDidNotComplete:
+                return true
+            case .providerNotSupported, .executableNotFound, .turnFailed, .emptyResponse:
+                return false
+            }
+        }
+        if let rpcError = error as? AppServerJSONRPCClientError {
+            switch rpcError {
+            case .processNotRunning:
+                return true
+            case .responseError(let message):
+                let lowered = message.lowercased()
+                return lowered.contains("process exited") || lowered.contains("timed out")
+            case .invalidResponse, .missingField:
+                return false
+            }
+        }
+        if error is CancellationError {
+            return true
+        }
+        return false
+    }
+
     private static func preferredReasoningEffort(for participant: Participant) -> String? {
         guard participant.provider.caseInsensitiveCompare("codex") == .orderedSame else {
             return nil
@@ -234,6 +284,31 @@ enum AppServerMeetingAgentRunner {
 
     private static func buildDeveloperInstructions(for participant: Participant) -> String {
         let roles = participant.roles.map(\.rawValue).joined(separator: ", ")
+        let roleGuidance: String
+        if participant.roles.contains(.planner) {
+            roleGuidance = """
+            Planner duties:
+            - Produce implementation plan and concrete artifact when ready.
+            - If status=done, artifact_path must be absolute and point to the latest planner deliverable.
+            - Never retask objective by yourself; ask host for retask.
+            """
+        } else if participant.roles.contains(.reviewer) {
+            roleGuidance = """
+            Reviewer duties:
+            - Review latest planner deliverable, call out defects and regressions.
+            - If no fresh planner artifact exists, use status=blocked with reason=waiting_for_input.
+            - Keep output focused on verification evidence and actionable changes.
+            """
+        } else if participant.roles.contains(.judge) {
+            roleGuidance = """
+            Judge duties:
+            - Decide only after planner/reviewer progress exists, unless host explicitly requests a decision.
+            - Use decision marker only when acting as judge.
+            """
+        } else {
+            roleGuidance = "General duties: provide concise, objective-aligned progress updates."
+        }
+
         return """
         You are a participant in a multi-agent technical meeting.
         Alias: \(participant.alias)
@@ -241,8 +316,15 @@ enum AppServerMeetingAgentRunner {
         Model: \(participant.model)
         Active roles: \(roles)
 
-        Always respond with one concise chat message appropriate for your role.
-        The conversation transcript format is strict: 「角色名称」：「说话」.
+        Keep your reply concise and objective-aligned.
+        \(roleGuidance)
+        The first line must follow transcript format: 「角色名称」：「说话」.
+        Only host directives can redefine objective or deliverable scope.
+        Host retask syntax is explicit: objective:..., deliverable:..., constraints:...
+        Append footer lines exactly:
+        status: progress|blocked|done
+        artifact_path: /absolute/path|(none)
+        reason: <short sentence>
         Do not include markdown fences.
         If and only if you are acting as judge, include:
         decision: continue|converge|terminate
@@ -402,6 +484,11 @@ private actor AppServerJSONRPCClient {
 
     func setEventHandler(_ handler: EventHandler?) {
         eventHandler = handler
+    }
+
+    func isProcessRunning() -> Bool {
+        guard let process else { return false }
+        return !isClosed && process.isRunning
     }
 
     func connect() async throws {

@@ -83,12 +83,15 @@ private enum ChatBubbleStyle: String, CaseIterable, Identifiable {
 
 struct ContentView: View {
     @State private var store = MeetingWorkspaceStore()
+    @State private var speechCoordinator = MeetingSpeechCoordinator.shared
     @State private var showingCreateMeetingSheet = false
     @State private var showingPolicySheet = false
     @State private var showingInspector = true
     @State private var showingAttachmentTray = false
     @AppStorage("quorum.chat.bubbleStyle") private var bubbleStyleRawValue: String = ChatBubbleStyle.chatty.rawValue
     @AppStorage("quorum.chat.bubbleStyle.meetingOverrides") private var bubbleStyleMeetingOverridesRawValue: String = "{}"
+    @AppStorage("quorum.tts.enabled") private var speechPlaybackEnabled = true
+    @AppStorage("quorum.tts.voiceSelections") private var speechVoiceSelectionsRawValue: String = "{}"
     @State private var createDraft = MeetingCreationDraft.defaultValue
     @State private var policyDraft = MeetingPolicyDraft.defaultValue
     @State private var createMeetingError: String?
@@ -127,6 +130,23 @@ struct ContentView: View {
             allowsMultipleSelection: true
         ) { result in
             importSkillFiles(result)
+        }
+        .onAppear {
+            speechCoordinator.setActiveMeeting(store.activeMeetingID)
+            syncSpeechForActiveMeeting()
+        }
+        .onChange(of: store.activeMeetingID) { _, newValue in
+            speechCoordinator.setActiveMeeting(newValue)
+            syncSpeechForActiveMeeting()
+        }
+        .onChange(of: store.activeMeeting?.messages ?? []) { _, _ in
+            syncSpeechForActiveMeeting()
+        }
+        .onChange(of: speechPlaybackEnabled) { _, isEnabled in
+            if !isEnabled {
+                speechCoordinator.stopSpeaking()
+            }
+            syncSpeechForActiveMeeting()
         }
     }
 
@@ -307,6 +327,7 @@ struct ContentView: View {
             ? (running ? "执行中..." : "启动中...")
             : (ended ? "Ended" : (running ? "Round" : "Start"))
         let autoTitle = autoBusy ? "Auto..." : (autopilotOn ? "Auto On" : "Auto Off")
+        let speechTitle = speechPlaybackEnabled ? "播报开" : "播报关"
 
         return HStack(spacing: 10) {
             VStack(alignment: .leading, spacing: 4) {
@@ -358,6 +379,24 @@ struct ContentView: View {
             .background(autopilotOn ? Color.green : palette.chipBackground)
             .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
             .disabled(!running || autoBusy || stopBusy || primaryBusy)
+
+            Button {
+                speechPlaybackEnabled.toggle()
+            } label: {
+                Label(
+                    speechTitle,
+                    systemImage: speechPlaybackEnabled
+                        ? (speechCoordinator.isSpeaking ? "speaker.wave.3.fill" : "speaker.wave.2.fill")
+                        : "speaker.slash.fill"
+                )
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(speechPlaybackEnabled ? .white : palette.textPrimary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(speechPlaybackEnabled ? Color.orange : palette.chipBackground)
+                .clipShape(RoundedRectangle(cornerRadius: 11, style: .continuous))
+            }
+            .buttonStyle(.plain)
 
             if anyBusy {
                 ProgressView()
@@ -527,6 +566,27 @@ struct ContentView: View {
 
             Divider()
 
+            VStack(alignment: .leading, spacing: 8) {
+                Text("语音氛围")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(palette.textSecondary)
+
+                Toggle("自动播报当前会议的新消息", isOn: $speechPlaybackEnabled)
+                    .toggleStyle(.switch)
+
+                Text("只播当前打开会议里新进来的 Agent 消息，不补播历史。")
+                    .font(.caption)
+                    .foregroundStyle(palette.textSecondary)
+
+                if speechCoordinator.isSpeaking {
+                    Text("正在播报中")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(Color.orange)
+                }
+            }
+
+            Divider()
+
             Text("参会者")
                 .font(.caption.weight(.semibold))
                 .foregroundStyle(palette.textSecondary)
@@ -534,12 +594,7 @@ struct ContentView: View {
             ScrollView {
                 LazyVStack(spacing: 8) {
                     ForEach(meeting.participants, id: \.alias) { participant in
-                        Button {
-                            participantLogSelection = ParticipantLogSelection(
-                                meetingID: meeting.id,
-                                participantAlias: participant.alias
-                            )
-                        } label: {
+                        VStack(alignment: .leading, spacing: 8) {
                             HStack(alignment: .center, spacing: 8) {
                                 Text(participant.resolvedAvatarEmoji)
                                     .font(.title3)
@@ -555,16 +610,50 @@ struct ContentView: View {
                                         .lineLimit(1)
                                 }
                                 Spacer(minLength: 8)
-                                Text("日志")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(palette.textSecondary)
+                                Button("日志") {
+                                    participantLogSelection = ParticipantLogSelection(
+                                        meetingID: meeting.id,
+                                        participantAlias: participant.alias
+                                    )
+                                }
+                                .buttonStyle(.plain)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(palette.textSecondary)
                             }
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .padding(10)
-                            .background(palette.chipBackground)
-                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+                            if participant.provider.caseInsensitiveCompare("human") == .orderedSame {
+                                Text("人工成员，不自动播报")
+                                    .font(.caption)
+                                    .foregroundStyle(palette.textSecondary)
+                            } else {
+                                HStack(spacing: 8) {
+                                    Picker(
+                                        "声音",
+                                        selection: speechVoiceSelection(for: meeting.id, participant: participant)
+                                    ) {
+                                        Text("自动推荐").tag(MeetingSpeechCoordinator.automaticVoiceSelectionToken)
+                                        ForEach(speechCoordinator.availableVoices) { voice in
+                                            Text(voice.displayLabel).tag(voice.id)
+                                        }
+                                    }
+                                    .labelsHidden()
+                                    .pickerStyle(.menu)
+
+                                    Button {
+                                        previewVoice(for: participant, in: meeting)
+                                    } label: {
+                                        Image(systemName: "play.circle")
+                                            .font(.system(size: 16, weight: .semibold))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help("试听当前声音")
+                                }
+                            }
                         }
-                        .buttonStyle(.plain)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(10)
+                        .background(palette.chipBackground)
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                     }
                 }
                 .padding(.vertical, 2)
@@ -1638,6 +1727,91 @@ struct ContentView: View {
 
     private func meetingStyleKey(for meetingID: UUID) -> String {
         meetingID.uuidString.lowercased()
+    }
+
+    private func syncSpeechForActiveMeeting() {
+        guard let meeting = store.activeMeeting else { return }
+        speechCoordinator.applySnapshot(
+            meeting: meeting,
+            enabled: speechPlaybackEnabled,
+            voiceIdentifierByAlias: voiceIdentifiersByAlias(for: meeting)
+        )
+    }
+
+    private func previewVoice(for participant: Participant, in meeting: Meeting) {
+        let explicitVoiceIdentifier = configuredVoiceIdentifier(for: meeting.id, alias: participant.alias)
+        speechCoordinator.previewVoice(
+            participant: participant,
+            explicitVoiceIdentifier: explicitVoiceIdentifier
+        )
+    }
+
+    private func speechVoiceSelection(for meetingID: UUID, participant: Participant) -> Binding<String> {
+        Binding(
+            get: {
+                if let configuredVoiceIdentifier = configuredVoiceIdentifier(for: meetingID, alias: participant.alias),
+                   speechCoordinator.availableVoices.contains(where: { $0.id == configuredVoiceIdentifier })
+                {
+                    return configuredVoiceIdentifier
+                }
+                return MeetingSpeechCoordinator.automaticVoiceSelectionToken
+            },
+            set: { selectedIdentifier in
+                var selections = speechVoiceSelections()
+                let key = speechVoiceKey(for: meetingID, alias: participant.alias)
+                if selectedIdentifier == MeetingSpeechCoordinator.automaticVoiceSelectionToken {
+                    selections.removeValue(forKey: key)
+                } else {
+                    selections[key] = selectedIdentifier
+                }
+                persistSpeechVoiceSelections(selections)
+            }
+        )
+    }
+
+    private func configuredVoiceIdentifier(for meetingID: UUID, alias: String) -> String? {
+        let key = speechVoiceKey(for: meetingID, alias: alias)
+        return speechVoiceSelections()[key]
+    }
+
+    private func voiceIdentifiersByAlias(for meeting: Meeting) -> [String: String] {
+        let selections = speechVoiceSelections()
+        var mapped: [String: String] = [:]
+        mapped.reserveCapacity(meeting.participants.count)
+
+        for participant in meeting.participants {
+            let key = speechVoiceKey(for: meeting.id, alias: participant.alias)
+            if let voiceIdentifier = selections[key] {
+                mapped[participant.alias.lowercased()] = voiceIdentifier
+            }
+        }
+        return mapped
+    }
+
+    private func speechVoiceSelections() -> [String: String] {
+        guard let data = speechVoiceSelectionsRawValue.data(using: .utf8) else {
+            return [:]
+        }
+        guard let selections = try? JSONDecoder().decode([String: String].self, from: data) else {
+            return [:]
+        }
+        return selections
+    }
+
+    private func persistSpeechVoiceSelections(_ selections: [String: String]) {
+        if selections.isEmpty {
+            speechVoiceSelectionsRawValue = "{}"
+            return
+        }
+        guard let data = try? JSONEncoder().encode(selections),
+              let rawValue = String(data: data, encoding: .utf8) else {
+            return
+        }
+        speechVoiceSelectionsRawValue = rawValue
+    }
+
+    private func speechVoiceKey(for meetingID: UUID, alias: String) -> String {
+        "\(meetingID.uuidString.lowercased())::\(alias.lowercased())"
     }
 
     private var palette: UIPalette {

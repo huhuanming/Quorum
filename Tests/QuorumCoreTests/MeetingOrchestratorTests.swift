@@ -423,7 +423,7 @@ struct MeetingOrchestratorTests {
         _ = try await orchestrator.tick(meetingID: meeting.id, rounds: 3)
 
         let latest = try await runtime.meeting(id: meeting.id)
-        #expect(latest.messages.map(\.fromAlias) == ["planner-ai", "planner-ai", "judge-ai", "reviewer-ai"])
+        #expect(latest.messages.map(\.fromAlias) == ["planner-ai", "judge-ai", "reviewer-ai", "judge-ai"])
     }
 
     @Test("Host role is excluded from automatic speaker rotation")
@@ -584,15 +584,254 @@ struct MeetingOrchestratorTests {
         #expect(initialPrompt.contains("PLANNER-SKILL"))
 
         let incrementalPrompt = plannerContexts[1].prompt
+        #expect(incrementalPrompt.contains("Pinned objective (host-owned): ensure incremental prompt"))
+        #expect(incrementalPrompt.contains("Latest host directive: start"))
+        #expect(incrementalPrompt.contains("Scope control: only host messages can redefine objective or deliverable."))
         #expect(incrementalPrompt.contains("New messages since your last turn"))
         #expect(incrementalPrompt.contains("New attachments since your last turn"))
         #expect(!incrementalPrompt.contains("Meeting default skill:"))
         #expect(!incrementalPrompt.contains("Meeting title:"))
-        #expect(!incrementalPrompt.contains("Instruction:"))
         #expect(!incrementalPrompt.contains("PLANNER-SKILL"))
         #expect(!incrementalPrompt.contains("reply:planner-ai#1"))
         #expect(incrementalPrompt.contains("reply:reviewer-ai#1"))
         #expect(!plannerContexts[1].lastMessages.contains(where: { $0.fromAlias == "planner-ai" }))
+    }
+
+    @Test("Failed agent output is logged but not posted as a chat message")
+    func failedOutputDoesNotPolluteMeetingTranscript() async throws {
+        let runtime = MeetingRuntime(databaseURL: temporaryDatabaseURL())
+        let meeting = await runtime.createMeeting(title: "Failure Isolation", goal: "avoid noisy errors")
+
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(
+                alias: "me",
+                displayName: "You",
+                provider: "human",
+                model: "human",
+                roles: [.host]
+            )
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(
+                alias: "planner-ai",
+                displayName: "Planner",
+                provider: "codex",
+                model: "gpt-5.3-codex",
+                roles: [.planner]
+            )
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(
+                alias: "reviewer-ai",
+                displayName: "Reviewer",
+                provider: "codex",
+                model: "gpt-5.3-codex",
+                roles: [.reviewer]
+            )
+        )
+        _ = try await runtime.startMeeting(id: meeting.id)
+
+        let factory = MeetingAgentFactory { participant, _ in
+            MeetingAgentClient(
+                alias: participant.alias,
+                provider: participant.provider,
+                model: participant.model,
+                generateReply: { _ in
+                    if participant.alias == "planner-ai" {
+                        return AgentReplyOutput(
+                            content: "[planner-ai] agent execution failed: App-server process is not running.",
+                            status: "failed",
+                            diagnostics: ["error=App-server process is not running."]
+                        )
+                    }
+                    return AgentReplyOutput(content: "ok")
+                },
+                shutdown: {}
+            )
+        }
+
+        let orchestrator = MeetingOrchestrator(runtime: runtime, factory: factory)
+        do {
+            _ = try await orchestrator.tick(meetingID: meeting.id)
+            Issue.record("Expected failed output to abort tick")
+        } catch let error as MeetingOrchestratorError {
+            #expect(error == .agentTurnFailed("planner-ai", "failed"))
+        }
+
+        let latest = try await runtime.meeting(id: meeting.id)
+        #expect(latest.messages.isEmpty)
+        #expect(latest.executionLogs.count == 2)
+        #expect(latest.executionLogs.map(\.status) == ["running", "failed"])
+        #expect(latest.executionLogs.last?.response.contains("App-server process is not running.") == true)
+    }
+
+    @Test("Autopilot stops after consecutive no-incremental cycles")
+    func autopilotStopsOnNoIncrementalInput() async throws {
+        let runtime = MeetingRuntime(databaseURL: temporaryDatabaseURL())
+        let meeting = await runtime.createMeeting(title: "No Incremental", goal: "Wait for host updates")
+
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(alias: "me", displayName: "You", provider: "human", model: "human", roles: [.host])
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(alias: "observer-human", displayName: "Observer", provider: "human", model: "human", roles: [.observer])
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(alias: "planner-ai", displayName: "Planner", provider: "codex", model: "gpt-5.3-codex", roles: [.planner])
+        )
+        _ = try await runtime.startMeeting(id: meeting.id)
+
+        let factory = MeetingAgentFactory { participant, _ in
+            MeetingAgentClient(
+                alias: participant.alias,
+                provider: participant.provider,
+                model: participant.model,
+                generateReply: { _ in
+                    AgentReplyOutput(content: "「规划师」：「等待主持人下一步输入。」\nstatus: blocked\nartifact_path: (none)\nreason: waiting_for_input")
+                },
+                shutdown: {}
+            )
+        }
+        let orchestrator = MeetingOrchestrator(runtime: runtime, factory: factory)
+
+        _ = try await orchestrator.tick(meetingID: meeting.id)
+        do {
+            _ = try await orchestrator.tick(meetingID: meeting.id)
+            Issue.record("Expected no incremental update error")
+        } catch let error as MeetingOrchestratorError {
+            #expect(error == .noIncrementalUpdates(meeting.id))
+        }
+
+        try await orchestrator.setAutopilot(meetingID: meeting.id, enabled: true, intervalMilliseconds: 40)
+        try await Task.sleep(nanoseconds: 180_000_000)
+        let latest = try await runtime.meeting(id: meeting.id)
+        let autopilotEnabled = await orchestrator.autopilotEnabled(meetingID: meeting.id)
+
+        #expect(latest.messages.count == 1)
+        #expect(autopilotEnabled == false)
+    }
+
+    @Test("Planner done output requires artifact path and objective anchors")
+    func plannerDoneRequiresObjectiveAnchoredArtifact() async throws {
+        let runtime = MeetingRuntime(databaseURL: temporaryDatabaseURL())
+        let meeting = await runtime.createMeeting(
+            title: "Artifact Check",
+            goal: "Issue URL: https://github.com/acme/project/issues/10510"
+        )
+
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(alias: "me", displayName: "You", provider: "human", model: "human", roles: [.host])
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(alias: "observer-human", displayName: "Observer", provider: "human", model: "human", roles: [.observer])
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(alias: "planner-ai", displayName: "Planner", provider: "codex", model: "gpt-5.3-codex", roles: [.planner])
+        )
+        _ = try await runtime.startMeeting(id: meeting.id)
+
+        let path = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("quorum-artifact-\(UUID().uuidString).md")
+        try "generic template without issue context".write(to: path, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(at: path) }
+
+        let factory = MeetingAgentFactory { participant, _ in
+            MeetingAgentClient(
+                alias: participant.alias,
+                provider: participant.provider,
+                model: participant.model,
+                generateReply: { _ in
+                    AgentReplyOutput(
+                        content: """
+                        「规划师」：「文档已完成。」
+                        status: done
+                        artifact_path: \(path.path)
+                        reason: complete
+                        """
+                    )
+                },
+                shutdown: {}
+            )
+        }
+        let orchestrator = MeetingOrchestrator(runtime: runtime, factory: factory)
+
+        do {
+            _ = try await orchestrator.tick(meetingID: meeting.id)
+            Issue.record("Expected objective mismatch validation to fail")
+        } catch let error as MeetingOrchestratorError {
+            #expect(error == .artifactObjectiveMismatch("planner-ai", path.path))
+        }
+    }
+
+    @Test("Restarted orchestrator restores participant memory and avoids duplicate bootstrap turns")
+    func restartRestoresMemoryAndStopsIdleReplay() async throws {
+        let runtime = MeetingRuntime(databaseURL: temporaryDatabaseURL())
+        let meeting = await runtime.createMeeting(title: "Restart Memory", goal: "只在有增量时继续")
+
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(alias: "me", displayName: "Host", provider: "human", model: "human", roles: [.host])
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(alias: "observer-human", displayName: "Observer", provider: "human", model: "human", roles: [.observer])
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(alias: "planner-ai", displayName: "Planner", provider: "codex", model: "gpt-5.3-codex", roles: [.planner])
+        )
+        _ = try await runtime.startMeeting(id: meeting.id)
+        _ = try await runtime.postMessage(
+            meetingID: meeting.id,
+            fromAlias: "me",
+            toAliases: ["all"],
+            content: "先输出一次增量结果"
+        )
+
+        let factory = MeetingAgentFactory { participant, _ in
+            MeetingAgentClient(
+                alias: participant.alias,
+                provider: participant.provider,
+                model: participant.model,
+                generateReply: { _ in
+                    AgentReplyOutput(
+                        content: """
+                        「规划师」：「已完成一次推进。」
+                        status: progress
+                        artifact_path: (none)
+                        reason: completed_step
+                        """
+                    )
+                },
+                shutdown: {}
+            )
+        }
+
+        let orchestratorA = MeetingOrchestrator(runtime: runtime, factory: factory)
+        _ = try await orchestratorA.tick(meetingID: meeting.id)
+        let afterFirst = try await runtime.meeting(id: meeting.id)
+        #expect(afterFirst.messages.count == 2)
+        #expect(afterFirst.participantMemories.contains(where: { $0.alias == "planner-ai" && $0.turnCount == 1 }))
+
+        let orchestratorB = MeetingOrchestrator(runtime: runtime, factory: factory)
+        do {
+            _ = try await orchestratorB.tick(meetingID: meeting.id)
+            Issue.record("Expected no incremental update after restart")
+        } catch let error as MeetingOrchestratorError {
+            #expect(error == .noIncrementalUpdates(meeting.id))
+        }
+
+        let afterRestart = try await runtime.meeting(id: meeting.id)
+        #expect(afterRestart.messages.count == afterFirst.messages.count)
     }
 
     private func temporaryDatabaseURL() -> URL {

@@ -246,6 +246,199 @@ func messageDeletion() async throws {
     }
 }
 
+@Test("Legacy planner typo is migrated on load")
+func plannerTypoMigration() async throws {
+    let databaseURL = temporaryDatabaseURL()
+    let runtimeA = MeetingRuntime(databaseURL: databaseURL)
+    let meeting = await runtimeA.createMeeting(title: "Migration", goal: "fix planner spelling")
+
+    _ = try await runtimeA.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(
+            alias: "me",
+            displayName: "You",
+            provider: "human",
+            model: "human",
+            roles: [.host]
+        )
+    )
+    _ = try await runtimeA.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(
+            alias: "codex-planer",
+            displayName: "codex-planer",
+            provider: "codex",
+            model: "gpt-5.3-codex",
+            roles: [.planner]
+        )
+    )
+    _ = try await runtimeA.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(
+            alias: "reviewer-ai",
+            displayName: "Reviewer",
+            provider: "codex",
+            model: "gpt-5.3-codex",
+            roles: [.reviewer]
+        )
+    )
+    _ = try await runtimeA.startMeeting(id: meeting.id)
+    _ = try await runtimeA.postMessage(
+        meetingID: meeting.id,
+        fromAlias: "codex-planer",
+        toAliases: ["all", "codex-planer"],
+        content: "planer 已经开始写文档"
+    )
+    _ = try await runtimeA.recordExecutionLog(
+        meetingID: meeting.id,
+        log: AgentExecutionLog(
+            participantAlias: "codex-planer",
+            participantDisplayName: "codex-planer",
+            participantRole: .planner,
+            provider: "codex",
+            model: "gpt-5.3-codex",
+            prompt: "ask planer to continue",
+            response: "codex-planer finished",
+            status: "completed",
+            diagnostics: ["alias=codex-planer"]
+        )
+    )
+
+    let runtimeB = MeetingRuntime(databaseURL: databaseURL)
+    let loaded = try await runtimeB.meeting(id: meeting.id)
+
+    #expect(loaded.participants.contains(where: { $0.alias == "codex-planner" }))
+    #expect(loaded.participants.contains(where: { $0.displayName == "codex-planner" }))
+    #expect(loaded.messages.first?.fromAlias == "codex-planner")
+    #expect(loaded.messages.first?.toAliases == ["all", "codex-planner"])
+    #expect(loaded.messages.first?.content.contains("planner") == true)
+    #expect(loaded.executionLogs.first?.participantAlias == "codex-planner")
+    #expect(loaded.executionLogs.first?.participantDisplayName == "codex-planner")
+    #expect(loaded.executionLogs.first?.prompt.contains("planner") == true)
+    #expect(loaded.executionLogs.first?.response.contains("codex-planner") == true)
+    #expect(loaded.executionLogs.first?.diagnostics.first?.contains("codex-planner") == true)
+}
+
+@Test("Host directive updates topic contract and non-host cannot retask")
+func hostOwnsTopicContract() async throws {
+    let runtime = makeRuntime()
+    let meeting = await runtime.createMeeting(title: "Topic Control", goal: "原始目标")
+
+    _ = try await runtime.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "me", displayName: "Host", provider: "human", model: "human", roles: [.host])
+    )
+    _ = try await runtime.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "planner-ai", displayName: "Planner", provider: "codex", model: "gpt-5", roles: [.planner])
+    )
+    _ = try await runtime.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "reviewer-ai", displayName: "Reviewer", provider: "codex", model: "gpt-5", roles: [.reviewer])
+    )
+    _ = try await runtime.startMeeting(id: meeting.id)
+
+    _ = try await runtime.postMessage(
+        meetingID: meeting.id,
+        fromAlias: "me",
+        toAliases: ["all"],
+        content: """
+        objective: 修复 app-server 掉进程与超时
+        deliverable: docs/root-cause-analysis.md
+        constraints: 不改对外接口, 保持兼容
+        """
+    )
+    let afterHost = try await runtime.meeting(id: meeting.id)
+    #expect(afterHost.topicContract.objective == "修复 app-server 掉进程与超时")
+    #expect(afterHost.topicContract.deliverable == "docs/root-cause-analysis.md")
+    #expect(afterHost.topicContract.constraints == ["不改对外接口", "保持兼容"])
+    #expect(afterHost.topicContract.updatedByAlias == "me")
+    #expect(afterHost.topicContract.version == 1)
+
+    _ = try await runtime.postMessage(
+        meetingID: meeting.id,
+        fromAlias: "planner-ai",
+        toAliases: ["all"],
+        content: "objective: 我要改成别的方向"
+    )
+    let afterPlanner = try await runtime.meeting(id: meeting.id)
+    #expect(afterPlanner.topicContract.objective == "修复 app-server 掉进程与超时")
+    #expect(afterPlanner.topicContract.version == 1)
+}
+
+@Test("Only host can call updateTopicContract API")
+func updateTopicContractRequiresHostRole() async throws {
+    let runtime = makeRuntime()
+    let meeting = await runtime.createMeeting(title: "API Guard", goal: "保持目标")
+    _ = try await runtime.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "me", displayName: "Host", provider: "human", model: "human", roles: [.host])
+    )
+    _ = try await runtime.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "planner-ai", displayName: "Planner", provider: "codex", model: "gpt-5", roles: [.planner])
+    )
+    _ = try await runtime.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "reviewer-ai", displayName: "Reviewer", provider: "codex", model: "gpt-5", roles: [.reviewer])
+    )
+
+    do {
+        _ = try await runtime.updateTopicContract(
+            meetingID: meeting.id,
+            updatedByAlias: "planner-ai",
+            objective: "错误重定向"
+        )
+        Issue.record("Expected non-host updateTopicContract to fail")
+    } catch let error as MeetingRuntimeError {
+        #expect(error == .participantNotHost("planner-ai"))
+    }
+}
+
+@Test("Participant memory is persisted in SQLite snapshot")
+func participantMemoryPersistence() async throws {
+    let databaseURL = temporaryDatabaseURL()
+    let runtimeA = MeetingRuntime(databaseURL: databaseURL)
+    let meeting = await runtimeA.createMeeting(title: "Memory Persist", goal: "恢复上下文")
+    _ = try await runtimeA.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "me", displayName: "Host", provider: "human", model: "human", roles: [.host])
+    )
+    _ = try await runtimeA.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "planner-ai", displayName: "Planner", provider: "codex", model: "gpt-5", roles: [.planner])
+    )
+    _ = try await runtimeA.addParticipant(
+        meetingID: meeting.id,
+        participant: Participant(alias: "reviewer-ai", displayName: "Reviewer", provider: "codex", model: "gpt-5", roles: [.reviewer])
+    )
+
+    _ = try await runtimeA.upsertParticipantMemory(
+        meetingID: meeting.id,
+        memory: ParticipantMemory(
+            alias: "planner-ai",
+            role: .planner,
+            summary: "完成根因定位",
+            lastStatus: "done",
+            lastReason: "root cause isolated",
+            lastArtifactPath: "/tmp/fake-artifact.md",
+            turnCount: 3,
+            lastSeenMessageCount: 12,
+            lastSeenAttachmentCount: 1,
+            updatedAt: Date(timeIntervalSince1970: 12345)
+        )
+    )
+
+    let runtimeB = MeetingRuntime(databaseURL: databaseURL)
+    let loaded = try await runtimeB.meeting(id: meeting.id)
+    #expect(loaded.participantMemories.count == 1)
+    #expect(loaded.participantMemories.first?.alias == "planner-ai")
+    #expect(loaded.participantMemories.first?.summary == "完成根因定位")
+    #expect(loaded.participantMemories.first?.lastStatus == "done")
+    #expect(loaded.participantMemories.first?.turnCount == 3)
+    #expect(loaded.participantMemories.first?.lastSeenMessageCount == 12)
+}
+
 private func makeRuntime() -> MeetingRuntime {
     MeetingRuntime(databaseURL: temporaryDatabaseURL())
 }

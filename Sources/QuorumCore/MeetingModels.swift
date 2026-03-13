@@ -124,6 +124,91 @@ public struct MeetingPolicy: Codable, Hashable, Sendable {
     public static let `default` = MeetingPolicy()
 }
 
+public struct MeetingTopicContract: Codable, Hashable, Sendable {
+    public var objective: String
+    public var deliverable: String
+    public var constraints: [String]
+    public var version: Int
+    public var updatedAt: Date
+    public var updatedByAlias: String
+
+    public init(
+        objective: String,
+        deliverable: String = "",
+        constraints: [String] = [],
+        version: Int = 0,
+        updatedAt: Date = Date(),
+        updatedByAlias: String = "system"
+    ) {
+        self.objective = objective.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.deliverable = deliverable.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.constraints = constraints.map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }.filter { !$0.isEmpty }
+        self.version = max(0, version)
+        self.updatedAt = updatedAt
+        self.updatedByAlias = updatedByAlias.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    public static func seeded(goal: String, createdAt: Date) -> MeetingTopicContract {
+        MeetingTopicContract(
+            objective: goal,
+            deliverable: "",
+            constraints: [],
+            version: 0,
+            updatedAt: createdAt,
+            updatedByAlias: "system"
+        )
+    }
+}
+
+public struct ParticipantMemory: Codable, Hashable, Sendable {
+    public var alias: String
+    public var role: ParticipantRole
+    public var summary: String
+    public var lastStatus: String
+    public var lastReason: String?
+    public var lastArtifactPath: String?
+    public var turnCount: Int
+    public var lastSeenMessageCount: Int
+    public var lastSeenAttachmentCount: Int
+    public var updatedAt: Date
+
+    public init(
+        alias: String,
+        role: ParticipantRole,
+        summary: String = "",
+        lastStatus: String = "unknown",
+        lastReason: String? = nil,
+        lastArtifactPath: String? = nil,
+        turnCount: Int = 0,
+        lastSeenMessageCount: Int = 0,
+        lastSeenAttachmentCount: Int = 0,
+        updatedAt: Date = Date()
+    ) {
+        self.alias = alias
+        self.role = role
+        self.summary = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.lastStatus = lastStatus.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let lastReason {
+            let normalized = lastReason.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.lastReason = normalized.isEmpty ? nil : normalized
+        } else {
+            self.lastReason = nil
+        }
+        if let lastArtifactPath {
+            let normalized = lastArtifactPath.trimmingCharacters(in: .whitespacesAndNewlines)
+            self.lastArtifactPath = normalized.isEmpty ? nil : normalized
+        } else {
+            self.lastArtifactPath = nil
+        }
+        self.turnCount = max(0, turnCount)
+        self.lastSeenMessageCount = max(0, lastSeenMessageCount)
+        self.lastSeenAttachmentCount = max(0, lastSeenAttachmentCount)
+        self.updatedAt = updatedAt
+    }
+}
+
 public struct Participant: Identifiable, Codable, Hashable, Sendable {
     public let id: UUID
     public var alias: String
@@ -234,6 +319,8 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
     public var defaultSkill: MeetingSkillDocument?
     public var additionalSkills: [MeetingSkillDocument]
     public var executionLogs: [AgentExecutionLog]
+    public var topicContract: MeetingTopicContract
+    public var participantMemories: [ParticipantMemory]
     public var judgeDecision: MeetingJudgeDecision?
     public var terminationReason: MeetingTerminationReason?
 
@@ -252,6 +339,8 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
         defaultSkill: MeetingSkillDocument? = nil,
         additionalSkills: [MeetingSkillDocument] = [],
         executionLogs: [AgentExecutionLog] = [],
+        topicContract: MeetingTopicContract? = nil,
+        participantMemories: [ParticipantMemory] = [],
         judgeDecision: MeetingJudgeDecision? = nil,
         terminationReason: MeetingTerminationReason? = nil
     ) {
@@ -269,6 +358,8 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
         self.defaultSkill = defaultSkill
         self.additionalSkills = additionalSkills
         self.executionLogs = executionLogs
+        self.topicContract = topicContract ?? MeetingTopicContract.seeded(goal: goal, createdAt: createdAt)
+        self.participantMemories = participantMemories
         self.judgeDecision = judgeDecision
         self.terminationReason = terminationReason
     }
@@ -288,6 +379,8 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
         case defaultSkill
         case additionalSkills
         case executionLogs
+        case topicContract
+        case participantMemories
         case judgeDecision
         case terminationReason
     }
@@ -308,6 +401,9 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
         defaultSkill = try container.decodeIfPresent(MeetingSkillDocument.self, forKey: .defaultSkill)
         additionalSkills = try container.decodeIfPresent([MeetingSkillDocument].self, forKey: .additionalSkills) ?? []
         executionLogs = try container.decodeIfPresent([AgentExecutionLog].self, forKey: .executionLogs) ?? []
+        topicContract = try container.decodeIfPresent(MeetingTopicContract.self, forKey: .topicContract)
+            ?? MeetingTopicContract.seeded(goal: goal, createdAt: createdAt)
+        participantMemories = try container.decodeIfPresent([ParticipantMemory].self, forKey: .participantMemories) ?? []
         judgeDecision = try container.decodeIfPresent(MeetingJudgeDecision.self, forKey: .judgeDecision)
         terminationReason = try container.decodeIfPresent(MeetingTerminationReason.self, forKey: .terminationReason)
     }
@@ -328,6 +424,8 @@ public struct Meeting: Identifiable, Codable, Hashable, Sendable {
         try container.encodeIfPresent(defaultSkill, forKey: .defaultSkill)
         try container.encode(additionalSkills, forKey: .additionalSkills)
         try container.encode(executionLogs, forKey: .executionLogs)
+        try container.encode(topicContract, forKey: .topicContract)
+        try container.encode(participantMemories, forKey: .participantMemories)
         try container.encodeIfPresent(judgeDecision, forKey: .judgeDecision)
         try container.encodeIfPresent(terminationReason, forKey: .terminationReason)
     }
@@ -341,6 +439,7 @@ public enum MeetingRuntimeError: Error, Equatable, Sendable {
     case meetingNotRunning(UUID)
     case meetingAlreadyEnded(UUID)
     case participantNotFound(String)
+    case participantNotHost(String)
     case emptyMessage
     case pathMustBeAbsolute(String)
     case pathNotFound(String)
@@ -363,6 +462,8 @@ extension MeetingRuntimeError: LocalizedError {
             return "Meeting is already ended: \(id.uuidString.lowercased())"
         case .participantNotFound(let alias):
             return "Participant not found for alias: \(alias)"
+        case .participantNotHost(let alias):
+            return "Participant is not host and cannot update topic contract: \(alias)"
         case .emptyMessage:
             return "Message content cannot be empty"
         case .pathMustBeAbsolute(let path):

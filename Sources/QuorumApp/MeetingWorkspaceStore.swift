@@ -137,6 +137,16 @@ final class MeetingWorkspaceStore {
                 _ = try await orchestrator.tick(meetingID: meeting.id, rounds: turns)
                 await refreshSnapshot()
                 setActionStatus("已执行一轮（\(turns)步）")
+            } catch let error as MeetingOrchestratorError {
+                await refreshSnapshot()
+                switch error {
+                case .noIncrementalUpdates:
+                    setActionStatus("无新增上下文，已跳过本轮")
+                case .allAgentsCoolingDown:
+                    setActionStatus("Agent 正在退避冷却中")
+                default:
+                    setError(error.localizedDescription)
+                }
             } catch {
                 await refreshSnapshot()
                 setError(error.localizedDescription)
@@ -215,6 +225,16 @@ final class MeetingWorkspaceStore {
                 }
 
                 await refreshSnapshot()
+            } catch let error as MeetingOrchestratorError {
+                await refreshSnapshot()
+                switch error {
+                case .noIncrementalUpdates:
+                    setActionStatus("消息已发送，当前无新增上下文可调度")
+                case .allAgentsCoolingDown:
+                    setActionStatus("消息已发送，Agent 正在冷却退避")
+                default:
+                    setError(error.localizedDescription)
+                }
             } catch {
                 await refreshSnapshot()
                 setError(error.localizedDescription)
