@@ -74,17 +74,17 @@ public struct MeetingAgentFactory: Sendable {
     }
 
     public static let appServer = MeetingAgentFactory { participant, _ in
-        MeetingAgentClient(
+        let session = AppServerMeetingAgentRunner.Session(participant: participant)
+        return MeetingAgentClient(
             alias: participant.alias,
             provider: participant.provider,
             model: participant.model,
             generateReply: { context in
-                try await AppServerMeetingAgentRunner.run(
-                    participant: participant,
-                    context: context
-                )
+                try await session.generateReply(context: context)
             },
-            shutdown: {}
+            shutdown: {
+                await session.shutdown()
+            }
         )
     }
 }
@@ -118,6 +118,8 @@ public actor MeetingOrchestrator {
         var speakerOrder: [String] = []
         var regularSpeakerOrder: [String] = []
         var judgeSpeakerOrder: [String] = []
+        var initialContextSentAliases: Set<String> = []
+        var lastSeenMessageCountByAlias: [String: Int] = [:]
         var nextSpeakerIndex: Int = 0
         var nextRegularSpeakerIndex: Int = 0
         var nextJudgeSpeakerIndex: Int = 0
@@ -160,7 +162,7 @@ public actor MeetingOrchestrator {
             throw MeetingOrchestratorError.agentClientMissing(speakerAlias)
         }
 
-        let context = buildContext(meeting: meeting, participant: participant)
+        let context = buildContext(meeting: meeting, participant: participant, state: &roomState)
         let startLog = AgentExecutionLog(
             participantAlias: participant.alias,
             participantDisplayName: participant.displayName,
@@ -219,6 +221,9 @@ public actor MeetingOrchestrator {
             content: reply,
             activeRole: participant.primaryRole
         )
+        let participantKey = normalizedAlias(participant.alias)
+        roomState.initialContextSentAliases.insert(participantKey)
+        roomState.lastSeenMessageCountByAlias[participantKey] = meeting.messages.count + 1
         let executionLog = AgentExecutionLog(
             participantAlias: participant.alias,
             participantDisplayName: participant.displayName,
@@ -345,14 +350,14 @@ public actor MeetingOrchestrator {
 
     private func hydrateRoomState(meeting: Meeting) async throws -> RoomState {
         var roomState = rooms[meeting.id] ?? RoomState()
-        let agents = meeting.participants.filter { $0.provider.caseInsensitiveCompare("human") != .orderedSame }
+        let agents = meeting.participants.filter {
+            $0.provider.caseInsensitiveCompare("human") != .orderedSame && $0.primaryRole != .host
+        }
         guard !agents.isEmpty else {
             throw MeetingOrchestratorError.noAgentParticipants(meeting.id)
         }
 
-        let desiredAliases = agents.map {
-            $0.alias.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).lowercased()
-        }
+        let desiredAliases = agents.map { normalizedAlias($0.alias) }
         let desiredSet = Set(desiredAliases)
 
         let staleAliases = roomState.clients.keys.filter { !desiredSet.contains($0) }
@@ -369,14 +374,18 @@ public actor MeetingOrchestrator {
                 roomState.clients[key] = created
             }
         }
+        roomState.initialContextSentAliases = Set(
+            roomState.initialContextSentAliases.filter { desiredSet.contains($0) }
+        )
+        roomState.lastSeenMessageCountByAlias = roomState.lastSeenMessageCountByAlias.filter { desiredSet.contains($0.key) }
 
         roomState.speakerOrder = desiredAliases
         roomState.regularSpeakerOrder = agents
             .filter { !$0.roles.contains(.judge) }
-            .map { $0.alias.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).lowercased() }
+            .map { normalizedAlias($0.alias) }
         roomState.judgeSpeakerOrder = agents
             .filter { $0.roles.contains(.judge) }
-            .map { $0.alias.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines).lowercased() }
+            .map { normalizedAlias($0.alias) }
 
         if roomState.lastPolicyMode != meeting.policy.mode {
             roomState.judgeGatedExpectJudgeNext = false
@@ -452,14 +461,35 @@ public actor MeetingOrchestrator {
         return alias
     }
 
-    private func buildContext(meeting: Meeting, participant: Participant) -> AgentTurnContext {
-        let recentMessages = Array(meeting.messages.suffix(16))
-        let prompt = buildPrompt(
-            meeting: meeting,
-            participant: participant,
-            recentMessages: recentMessages,
-            attachments: meeting.attachments
-        )
+    private func buildContext(meeting: Meeting, participant: Participant, state: inout RoomState) -> AgentTurnContext {
+        let aliasKey = normalizedAlias(participant.alias)
+        let hasSentInitialContext = state.initialContextSentAliases.contains(aliasKey)
+        let recentMessages: [MeetingMessage]
+        let prompt: String
+
+        if hasSentInitialContext {
+            let startIndex = state.lastSeenMessageCountByAlias[aliasKey] ?? 0
+            recentMessages = incrementalMessages(
+                meeting: meeting,
+                participantAlias: aliasKey,
+                startIndex: startIndex
+            )
+            prompt = buildIncrementalPrompt(
+                meeting: meeting,
+                participant: participant,
+                recentMessages: recentMessages,
+                attachments: meeting.attachments
+            )
+        } else {
+            recentMessages = Array(meeting.messages.suffix(16))
+            prompt = buildInitialPrompt(
+                meeting: meeting,
+                participant: participant,
+                recentMessages: recentMessages,
+                attachments: meeting.attachments
+            )
+        }
+
         return AgentTurnContext(
             meeting: meeting,
             participant: participant,
@@ -469,7 +499,7 @@ public actor MeetingOrchestrator {
         )
     }
 
-    private func buildPrompt(
+    private func buildInitialPrompt(
         meeting: Meeting,
         participant: Participant,
         recentMessages: [MeetingMessage],
@@ -543,6 +573,65 @@ public actor MeetingOrchestrator {
         lines.append("  decision: continue | decision: converge | decision: terminate")
         lines.append("- Do not include markdown fences.")
         return lines.joined(separator: "\n")
+    }
+
+    private func buildIncrementalPrompt(
+        meeting: Meeting,
+        participant: Participant,
+        recentMessages: [MeetingMessage],
+        attachments: [MeetingAttachment]
+    ) -> String {
+        var lines: [String] = []
+        lines.append("Continue the ongoing multi-agent meeting.")
+        lines.append("Current time: \(now().ISO8601Format())")
+        lines.append("Meeting title: \(meeting.title)")
+        lines.append("Meeting goal: \(meeting.goal)")
+        lines.append("Your alias: \(participant.alias)")
+        lines.append("Your model: \(participant.model)")
+        let participantRoles = participant.roles.map(\.rawValue).joined(separator: ", ")
+        lines.append("Your roles: \(participantRoles)")
+
+        lines.append("New messages since your last turn (excluding your own):")
+        if recentMessages.isEmpty {
+            lines.append("- (none)")
+        } else {
+            for message in recentMessages {
+                let utterance = quotedUtterance(for: message, in: meeting)
+                lines.append("- [\(message.createdAt.ISO8601Format())] \(utterance)")
+            }
+        }
+
+        lines.append("Attachments:")
+        if attachments.isEmpty {
+            lines.append("- (none)")
+        } else {
+            for attachment in attachments {
+                lines.append("- [\(attachment.kind.rawValue)] \(attachment.path)")
+            }
+        }
+
+        lines.append("Instruction:")
+        lines.append("- Reply with one concise meeting message in your role.")
+        lines.append("- The conversation transcript format is strict: 「角色名称」：「说话」.")
+        lines.append("- If you are acting as judge and the meeting can end, include exactly one decision marker:")
+        lines.append("  decision: continue | decision: converge | decision: terminate")
+        lines.append("- Do not include markdown fences.")
+        return lines.joined(separator: "\n")
+    }
+
+    private func incrementalMessages(
+        meeting: Meeting,
+        participantAlias: String,
+        startIndex: Int
+    ) -> [MeetingMessage] {
+        guard startIndex < meeting.messages.count else { return [] }
+        return meeting.messages[startIndex...].filter {
+            normalizedAlias($0.fromAlias) != participantAlias
+        }
+    }
+
+    private func normalizedAlias(_ rawAlias: String) -> String {
+        rawAlias.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
     }
 
     private func quotedUtterance(for message: MeetingMessage, in meeting: Meeting) -> String {

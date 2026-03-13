@@ -32,99 +32,173 @@ struct ResolvedAgentExecutable: Sendable {
 }
 
 enum AppServerMeetingAgentRunner {
-    static func run(participant: Participant, context: AgentTurnContext) async throws -> AgentReplyOutput {
-        let provider = participant.provider.lowercased()
-        guard provider != "human" else {
-            throw AppServerMeetingAgentRunnerError.providerNotSupported(provider)
+    actor Session {
+        private let participant: Participant
+        private let provider: String
+        private let resolved: ResolvedAgentExecutable?
+        private let cwd: String
+
+        private var client: AppServerJSONRPCClient?
+        private var threadID: String?
+
+        init(
+            participant: Participant,
+            cwd: String = FileManager.default.currentDirectoryPath
+        ) {
+            self.participant = participant
+            self.provider = participant.provider.lowercased()
+            self.resolved = AppServerMeetingAgentRunner.resolveExecutable(for: participant.provider.lowercased())
+            self.cwd = cwd
         }
 
-        guard let resolved = resolveExecutable(for: provider) else {
-            // Fallback to an explicit message so meeting flow still works even when local adapter is missing.
-            return AgentReplyOutput(
-                content: "[\(participant.alias)] agent executable missing for provider '\(provider)'. Configure env and retry.",
-                status: "failed: executable_missing",
-                diagnostics: ["provider=\(provider) executable_source=missing"]
-            )
-        }
+        func generateReply(context: AgentTurnContext) async throws -> AgentReplyOutput {
+            guard provider != "human" else {
+                throw AppServerMeetingAgentRunnerError.providerNotSupported(provider)
+            }
+            guard let resolved else {
+                return AgentReplyOutput(
+                    content: "[\(participant.alias)] agent executable missing for provider '\(provider)'. Configure env and retry.",
+                    status: "failed: executable_missing",
+                    diagnostics: ["provider=\(provider) executable_source=missing"]
+                )
+            }
 
-        let cwd = FileManager.default.currentDirectoryPath
-        let client = AppServerJSONRPCClient(cwd: cwd, executable: resolved.executable)
-        let accumulator = AppServerStreamAccumulator()
+            let accumulator = AppServerStreamAccumulator()
 
-        await client.setEventHandler { event in
-            switch event {
-            case .agentMessageDelta(_, let delta):
-                await accumulator.appendDelta(delta)
-            case .agentMessageCompleted(let phase, let text):
-                if phase == "final_answer" {
-                    await accumulator.setFinalAnswer(text)
+            do {
+                let client = try await ensureConnectedClient(executable: resolved.executable)
+                await client.setEventHandler { event in
+                    await AppServerMeetingAgentRunner.forward(event: event, to: accumulator)
                 }
-            case .commandOutputDelta(_, let delta):
-                await accumulator.appendDiagnostic("command-output: \(delta)")
-            case .diagnostic(let message):
-                await accumulator.appendDiagnostic(message)
-            case .turnCompleted(let turnId, let status):
-                await accumulator.appendDiagnostic("turn-completed turn_id=\(turnId) status=\(status)")
-            case .turnStarted(let turnId):
-                await accumulator.appendDiagnostic("turn-started turn_id=\(turnId)")
-            case .threadStarted(let threadId):
-                await accumulator.appendDiagnostic("thread-started thread_id=\(threadId)")
-            case .processTerminated(let exitCode):
-                await accumulator.appendDiagnostic("process-terminated exit_code=\(exitCode)")
+
+                let threadID = try await ensureThreadID(client: client)
+                let turnID = try await client.startTurn(
+                    threadId: threadID,
+                    input: context.prompt,
+                    effort: AppServerMeetingAgentRunner.preferredReasoningEffort(for: participant)
+                )
+                let status = try await AppServerMeetingAgentRunner.waitTurnWithTimeout(
+                    client: client,
+                    turnID: turnID,
+                    alias: participant.alias,
+                    timeoutSeconds: 45
+                )
+                return try await AppServerMeetingAgentRunner.buildOutput(
+                    participant: participant,
+                    provider: provider,
+                    resolved: resolved,
+                    status: status,
+                    accumulator: accumulator
+                )
+            } catch {
+                var diagnostics = await accumulator.diagnostics
+                diagnostics.insert("provider=\(provider) executable=\(resolved.executable) source=\(resolved.source)", at: 0)
+                diagnostics.append("error=\(error.localizedDescription)")
+                await resetTransport()
+                return AgentReplyOutput(
+                    content: "[\(participant.alias)] agent execution failed: \(error.localizedDescription)",
+                    status: "failed",
+                    diagnostics: diagnostics
+                )
             }
         }
 
-        do {
-            try await client.connect()
-            let developerInstructions = buildDeveloperInstructions(for: participant)
-            let threadID = try await client.startThread(
+        func shutdown() async {
+            await resetTransport()
+        }
+
+        private func ensureConnectedClient(executable: String) async throws -> AppServerJSONRPCClient {
+            if let client {
+                return client
+            }
+            let created = AppServerJSONRPCClient(cwd: cwd, executable: executable)
+            try await created.connect()
+            client = created
+            return created
+        }
+
+        private func ensureThreadID(client: AppServerJSONRPCClient) async throws -> String {
+            if let threadID {
+                return threadID
+            }
+            let developerInstructions = AppServerMeetingAgentRunner.buildDeveloperInstructions(for: participant)
+            let createdThreadID = try await client.startThread(
                 model: participant.model,
                 developerInstructions: developerInstructions,
                 approvalPolicy: "never",
                 sandbox: "danger-full-access"
             )
-            let turnID = try await client.startTurn(
-                threadId: threadID,
-                input: context.prompt,
-                effort: preferredReasoningEffort(for: participant)
-            )
-            let status = try await waitTurnWithTimeout(
-                client: client,
-                turnID: turnID,
-                alias: participant.alias,
-                timeoutSeconds: 45
-            )
-            let outputBuffer = await accumulator.buffer
-            let finalAnswer = await accumulator.finalAnswer
-            var diagnostics = await accumulator.diagnostics
-            diagnostics.insert("provider=\(provider) executable=\(resolved.executable) source=\(resolved.source)", at: 0)
-            await client.shutdown()
-
-            guard status == "completed" else {
-                throw AppServerMeetingAgentRunnerError.turnFailed(status)
-            }
-
-            let trimmedFinal = finalAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmedFinal.isEmpty {
-                return AgentReplyOutput(content: trimmedFinal, status: status, diagnostics: diagnostics)
-            }
-            let trimmedBuffer = outputBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !trimmedBuffer.isEmpty else {
-                throw AppServerMeetingAgentRunnerError.emptyResponse(participant.alias)
-            }
-            return AgentReplyOutput(content: trimmedBuffer, status: status, diagnostics: diagnostics)
-        } catch {
-            var diagnostics = await accumulator.diagnostics
-            diagnostics.insert("provider=\(provider) executable=\(resolved.executable) source=\(resolved.source)", at: 0)
-            diagnostics.append("error=\(error.localizedDescription)")
-            await client.shutdown()
-            // Degrade gracefully instead of breaking the whole room.
-            return AgentReplyOutput(
-                content: "[\(participant.alias)] agent execution failed: \(error.localizedDescription)",
-                status: "failed",
-                diagnostics: diagnostics
-            )
+            threadID = createdThreadID
+            return createdThreadID
         }
+
+        private func resetTransport() async {
+            if let client {
+                await client.shutdown()
+            }
+            client = nil
+            threadID = nil
+        }
+    }
+
+    static func run(participant: Participant, context: AgentTurnContext) async throws -> AgentReplyOutput {
+        let session = Session(participant: participant)
+        let output = try await session.generateReply(context: context)
+        await session.shutdown()
+        return output
+    }
+
+    private static func forward(
+        event: AppServerEvent,
+        to accumulator: AppServerStreamAccumulator
+    ) async {
+        switch event {
+        case .agentMessageDelta(_, let delta):
+            await accumulator.appendDelta(delta)
+        case .agentMessageCompleted(let phase, let text):
+            if phase == "final_answer" {
+                await accumulator.setFinalAnswer(text)
+            }
+        case .commandOutputDelta(_, let delta):
+            await accumulator.appendDiagnostic("command-output: \(delta)")
+        case .diagnostic(let message):
+            await accumulator.appendDiagnostic(message)
+        case .turnCompleted(let turnId, let status):
+            await accumulator.appendDiagnostic("turn-completed turn_id=\(turnId) status=\(status)")
+        case .turnStarted(let turnId):
+            await accumulator.appendDiagnostic("turn-started turn_id=\(turnId)")
+        case .threadStarted(let threadId):
+            await accumulator.appendDiagnostic("thread-started thread_id=\(threadId)")
+        case .processTerminated(let exitCode):
+            await accumulator.appendDiagnostic("process-terminated exit_code=\(exitCode)")
+        }
+    }
+
+    private static func buildOutput(
+        participant: Participant,
+        provider: String,
+        resolved: ResolvedAgentExecutable,
+        status: String,
+        accumulator: AppServerStreamAccumulator
+    ) async throws -> AgentReplyOutput {
+        let outputBuffer = await accumulator.buffer
+        let finalAnswer = await accumulator.finalAnswer
+        var diagnostics = await accumulator.diagnostics
+        diagnostics.insert("provider=\(provider) executable=\(resolved.executable) source=\(resolved.source)", at: 0)
+
+        guard status == "completed" else {
+            throw AppServerMeetingAgentRunnerError.turnFailed(status)
+        }
+
+        let trimmedFinal = finalAnswer.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedFinal.isEmpty {
+            return AgentReplyOutput(content: trimmedFinal, status: status, diagnostics: diagnostics)
+        }
+        let trimmedBuffer = outputBuffer.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedBuffer.isEmpty else {
+            throw AppServerMeetingAgentRunnerError.emptyResponse(participant.alias)
+        }
+        return AgentReplyOutput(content: trimmedBuffer, status: status, diagnostics: diagnostics)
     }
 
     private static func waitTurnWithTimeout(

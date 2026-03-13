@@ -54,7 +54,7 @@ struct MeetingOrchestratorTests {
                 model: participant.model,
                 generateReply: { context in
                     let last = context.lastMessages.last?.content ?? "(none)"
-                    return "\(participant.alias) reply: \(last)"
+                    return AgentReplyOutput(content: "\(participant.alias) reply: \(last)")
                 },
                 shutdown: {}
             )
@@ -124,9 +124,9 @@ struct MeetingOrchestratorTests {
                 model: participant.model,
                 generateReply: { _ in
                     if participant.alias == "judge-ai" {
-                        return "decision: terminate\n收敛完成，终止会议。"
+                        return AgentReplyOutput(content: "decision: terminate\n收敛完成，终止会议。")
                     }
-                    return "继续推进。"
+                    return AgentReplyOutput(content: "继续推进。")
                 },
                 shutdown: {}
             )
@@ -188,9 +188,9 @@ struct MeetingOrchestratorTests {
                 model: participant.model,
                 generateReply: { _ in
                     if participant.alias == "judge-ai" {
-                        return "decision: terminate\nI think we can stop."
+                        return AgentReplyOutput(content: "decision: terminate\nI think we can stop.")
                     }
-                    return "planner says continue"
+                    return AgentReplyOutput(content: "planner says continue")
                 },
                 shutdown: {}
             )
@@ -252,7 +252,7 @@ struct MeetingOrchestratorTests {
                 model: participant.model,
                 generateReply: { context in
                     let room = String(context.meeting.id.uuidString.lowercased().prefix(6))
-                    return "\(participant.alias) from \(room)"
+                    return AgentReplyOutput(content: "\(participant.alias) from \(room)")
                 },
                 shutdown: {}
             )
@@ -337,7 +337,7 @@ struct MeetingOrchestratorTests {
                 provider: participant.provider,
                 model: participant.model,
                 generateReply: { _ in
-                    "speak:\(participant.alias)"
+                    AgentReplyOutput(content: "speak:\(participant.alias)")
                 },
                 shutdown: {}
             )
@@ -407,7 +407,7 @@ struct MeetingOrchestratorTests {
                 provider: participant.provider,
                 model: participant.model,
                 generateReply: { _ in
-                    "from:\(participant.alias)"
+                    AgentReplyOutput(content: "from:\(participant.alias)")
                 },
                 shutdown: {}
             )
@@ -424,6 +424,172 @@ struct MeetingOrchestratorTests {
 
         let latest = try await runtime.meeting(id: meeting.id)
         #expect(latest.messages.map(\.fromAlias) == ["planner-ai", "planner-ai", "judge-ai", "reviewer-ai"])
+    }
+
+    @Test("Host role is excluded from automatic speaker rotation")
+    func hostRoleExcludedFromAutomaticRotation() async throws {
+        let runtime = MeetingRuntime(databaseURL: temporaryDatabaseURL())
+        let meeting = await runtime.createMeeting(title: "Host Rotation", goal: "host should not auto speak")
+
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(
+                alias: "me",
+                displayName: "You",
+                provider: "human",
+                model: "human",
+                roles: [.host]
+            )
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(
+                alias: "host-ai",
+                displayName: "Host AI",
+                provider: "codex",
+                model: "gpt-5",
+                roles: [.host]
+            )
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(
+                alias: "planner-ai",
+                displayName: "Planner",
+                provider: "claude",
+                model: "claude-sonnet",
+                roles: [.planner]
+            )
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(
+                alias: "reviewer-ai",
+                displayName: "Reviewer",
+                provider: "codex",
+                model: "gpt-5",
+                roles: [.reviewer]
+            )
+        )
+        _ = try await runtime.startMeeting(id: meeting.id)
+
+        let factory = MeetingAgentFactory { participant, _ in
+            MeetingAgentClient(
+                alias: participant.alias,
+                provider: participant.provider,
+                model: participant.model,
+                generateReply: { _ in
+                    AgentReplyOutput(content: "from:\(participant.alias)")
+                },
+                shutdown: {}
+            )
+        }
+
+        let orchestrator = MeetingOrchestrator(runtime: runtime, factory: factory)
+        _ = try await orchestrator.tick(meetingID: meeting.id, rounds: 3)
+
+        let latest = try await runtime.meeting(id: meeting.id)
+        #expect(latest.messages.map(\.fromAlias) == ["planner-ai", "reviewer-ai", "planner-ai"])
+    }
+
+    @Test("Initial prompt sends full skill once, later turns are incremental and exclude own echo")
+    func promptBootstrapsOnceThenUsesIncrementalMessages() async throws {
+        let runtime = MeetingRuntime(databaseURL: temporaryDatabaseURL())
+        let meeting = await runtime.createMeeting(
+            title: "Prompt Cadence",
+            goal: "ensure incremental prompt",
+            defaultSkill: MeetingSkillDocument(name: "meeting-default", content: "MEETING-SKILL")
+        )
+
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(
+                alias: "me",
+                displayName: "You",
+                provider: "human",
+                model: "human",
+                roles: [.host]
+            )
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(
+                alias: "planner-ai",
+                displayName: "Planner",
+                provider: "claude",
+                model: "claude-sonnet",
+                roles: [.planner],
+                initialSkill: MeetingSkillDocument(name: "planner-initial", content: "PLANNER-SKILL")
+            )
+        )
+        _ = try await runtime.addParticipant(
+            meetingID: meeting.id,
+            participant: Participant(
+                alias: "reviewer-ai",
+                displayName: "Reviewer",
+                provider: "codex",
+                model: "gpt-5",
+                roles: [.reviewer]
+            )
+        )
+        _ = try await runtime.startMeeting(id: meeting.id)
+
+        _ = try await runtime.postMessage(
+            meetingID: meeting.id,
+            fromAlias: "me",
+            toAliases: ["all"],
+            content: "start"
+        )
+
+        actor TurnRecorder {
+            private var contextsByAlias: [String: [AgentTurnContext]] = [:]
+            private var turnCounterByAlias: [String: Int] = [:]
+
+            func record(alias: String, context: AgentTurnContext) -> Int {
+                contextsByAlias[alias, default: []].append(context)
+                let nextTurn = (turnCounterByAlias[alias] ?? 0) + 1
+                turnCounterByAlias[alias] = nextTurn
+                return nextTurn
+            }
+
+            func contexts(alias: String) -> [AgentTurnContext] {
+                contextsByAlias[alias] ?? []
+            }
+        }
+
+        let recorder = TurnRecorder()
+        let factory = MeetingAgentFactory { participant, _ in
+            MeetingAgentClient(
+                alias: participant.alias,
+                provider: participant.provider,
+                model: participant.model,
+                generateReply: { context in
+                    let turn = await recorder.record(alias: participant.alias, context: context)
+                    return AgentReplyOutput(content: "reply:\(participant.alias)#\(turn)")
+                },
+                shutdown: {}
+            )
+        }
+
+        let orchestrator = MeetingOrchestrator(runtime: runtime, factory: factory)
+        _ = try await orchestrator.tick(meetingID: meeting.id, rounds: 3)
+
+        let plannerContexts = await recorder.contexts(alias: "planner-ai")
+        #expect(plannerContexts.count == 2)
+
+        let initialPrompt = plannerContexts[0].prompt
+        #expect(initialPrompt.contains("Meeting default skill:"))
+        #expect(initialPrompt.contains("MEETING-SKILL"))
+        #expect(initialPrompt.contains("Your initial skill:"))
+        #expect(initialPrompt.contains("PLANNER-SKILL"))
+
+        let incrementalPrompt = plannerContexts[1].prompt
+        #expect(incrementalPrompt.contains("New messages since your last turn"))
+        #expect(!incrementalPrompt.contains("Meeting default skill:"))
+        #expect(!incrementalPrompt.contains("PLANNER-SKILL"))
+        #expect(!incrementalPrompt.contains("reply:planner-ai#1"))
+        #expect(incrementalPrompt.contains("reply:reviewer-ai#1"))
+        #expect(!plannerContexts[1].lastMessages.contains(where: { $0.fromAlias == "planner-ai" }))
     }
 
     private func temporaryDatabaseURL() -> URL {
