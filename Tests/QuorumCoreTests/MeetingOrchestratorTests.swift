@@ -585,7 +585,10 @@ struct MeetingOrchestratorTests {
 
         let incrementalPrompt = plannerContexts[1].prompt
         #expect(incrementalPrompt.contains("New messages since your last turn"))
+        #expect(incrementalPrompt.contains("New attachments since your last turn"))
         #expect(!incrementalPrompt.contains("Meeting default skill:"))
+        #expect(!incrementalPrompt.contains("Meeting title:"))
+        #expect(!incrementalPrompt.contains("Instruction:"))
         #expect(!incrementalPrompt.contains("PLANNER-SKILL"))
         #expect(!incrementalPrompt.contains("reply:planner-ai#1"))
         #expect(incrementalPrompt.contains("reply:reviewer-ai#1"))

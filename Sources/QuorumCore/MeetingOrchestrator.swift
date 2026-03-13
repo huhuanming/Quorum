@@ -120,6 +120,7 @@ public actor MeetingOrchestrator {
         var judgeSpeakerOrder: [String] = []
         var initialContextSentAliases: Set<String> = []
         var lastSeenMessageCountByAlias: [String: Int] = [:]
+        var lastSeenAttachmentCountByAlias: [String: Int] = [:]
         var nextSpeakerIndex: Int = 0
         var nextRegularSpeakerIndex: Int = 0
         var nextJudgeSpeakerIndex: Int = 0
@@ -224,6 +225,7 @@ public actor MeetingOrchestrator {
         let participantKey = normalizedAlias(participant.alias)
         roomState.initialContextSentAliases.insert(participantKey)
         roomState.lastSeenMessageCountByAlias[participantKey] = meeting.messages.count + 1
+        roomState.lastSeenAttachmentCountByAlias[participantKey] = meeting.attachments.count
         let executionLog = AgentExecutionLog(
             participantAlias: participant.alias,
             participantDisplayName: participant.displayName,
@@ -378,6 +380,7 @@ public actor MeetingOrchestrator {
             roomState.initialContextSentAliases.filter { desiredSet.contains($0) }
         )
         roomState.lastSeenMessageCountByAlias = roomState.lastSeenMessageCountByAlias.filter { desiredSet.contains($0.key) }
+        roomState.lastSeenAttachmentCountByAlias = roomState.lastSeenAttachmentCountByAlias.filter { desiredSet.contains($0.key) }
 
         roomState.speakerOrder = desiredAliases
         roomState.regularSpeakerOrder = agents
@@ -465,28 +468,35 @@ public actor MeetingOrchestrator {
         let aliasKey = normalizedAlias(participant.alias)
         let hasSentInitialContext = state.initialContextSentAliases.contains(aliasKey)
         let recentMessages: [MeetingMessage]
+        let currentAttachments: [MeetingAttachment]
         let prompt: String
 
         if hasSentInitialContext {
-            let startIndex = state.lastSeenMessageCountByAlias[aliasKey] ?? 0
+            let messageStartIndex = state.lastSeenMessageCountByAlias[aliasKey] ?? 0
+            let attachmentStartIndex = state.lastSeenAttachmentCountByAlias[aliasKey] ?? 0
             recentMessages = incrementalMessages(
                 meeting: meeting,
                 participantAlias: aliasKey,
-                startIndex: startIndex
+                startIndex: messageStartIndex
+            )
+            currentAttachments = incrementalAttachments(
+                meeting: meeting,
+                startIndex: attachmentStartIndex
             )
             prompt = buildIncrementalPrompt(
                 meeting: meeting,
                 participant: participant,
                 recentMessages: recentMessages,
-                attachments: meeting.attachments
+                attachments: currentAttachments
             )
         } else {
             recentMessages = Array(meeting.messages.suffix(16))
+            currentAttachments = meeting.attachments
             prompt = buildInitialPrompt(
                 meeting: meeting,
                 participant: participant,
                 recentMessages: recentMessages,
-                attachments: meeting.attachments
+                attachments: currentAttachments
             )
         }
 
@@ -494,7 +504,7 @@ public actor MeetingOrchestrator {
             meeting: meeting,
             participant: participant,
             lastMessages: recentMessages,
-            attachments: meeting.attachments,
+            attachments: currentAttachments,
             prompt: prompt
         )
     }
@@ -582,15 +592,8 @@ public actor MeetingOrchestrator {
         attachments: [MeetingAttachment]
     ) -> String {
         var lines: [String] = []
-        lines.append("Continue the ongoing multi-agent meeting.")
+        lines.append("Incremental update for ongoing meeting.")
         lines.append("Current time: \(now().ISO8601Format())")
-        lines.append("Meeting title: \(meeting.title)")
-        lines.append("Meeting goal: \(meeting.goal)")
-        lines.append("Your alias: \(participant.alias)")
-        lines.append("Your model: \(participant.model)")
-        let participantRoles = participant.roles.map(\.rawValue).joined(separator: ", ")
-        lines.append("Your roles: \(participantRoles)")
-
         lines.append("New messages since your last turn (excluding your own):")
         if recentMessages.isEmpty {
             lines.append("- (none)")
@@ -601,7 +604,7 @@ public actor MeetingOrchestrator {
             }
         }
 
-        lines.append("Attachments:")
+        lines.append("New attachments since your last turn:")
         if attachments.isEmpty {
             lines.append("- (none)")
         } else {
@@ -609,13 +612,6 @@ public actor MeetingOrchestrator {
                 lines.append("- [\(attachment.kind.rawValue)] \(attachment.path)")
             }
         }
-
-        lines.append("Instruction:")
-        lines.append("- Reply with one concise meeting message in your role.")
-        lines.append("- The conversation transcript format is strict: 「角色名称」：「说话」.")
-        lines.append("- If you are acting as judge and the meeting can end, include exactly one decision marker:")
-        lines.append("  decision: continue | decision: converge | decision: terminate")
-        lines.append("- Do not include markdown fences.")
         return lines.joined(separator: "\n")
     }
 
@@ -628,6 +624,14 @@ public actor MeetingOrchestrator {
         return meeting.messages[startIndex...].filter {
             normalizedAlias($0.fromAlias) != participantAlias
         }
+    }
+
+    private func incrementalAttachments(
+        meeting: Meeting,
+        startIndex: Int
+    ) -> [MeetingAttachment] {
+        guard startIndex < meeting.attachments.count else { return [] }
+        return Array(meeting.attachments[startIndex...])
     }
 
     private func normalizedAlias(_ rawAlias: String) -> String {

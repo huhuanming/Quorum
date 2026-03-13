@@ -242,6 +242,8 @@ enum AppServerMeetingAgentRunner {
         Active roles: \(roles)
 
         Always respond with one concise chat message appropriate for your role.
+        The conversation transcript format is strict: 「角色名称」：「说话」.
+        Do not include markdown fences.
         If and only if you are acting as judge, include:
         decision: continue|converge|terminate
         """
