@@ -133,9 +133,10 @@ final class MeetingWorkspaceStore {
         Task {
             defer { isRunningRound = false }
             do {
-                _ = try await orchestrator.tick(meetingID: meeting.id)
+                let turns = automaticAgentTurnCount(in: meeting)
+                _ = try await orchestrator.tick(meetingID: meeting.id, rounds: turns)
                 await refreshSnapshot()
-                setActionStatus("已执行一轮")
+                setActionStatus("已执行一轮（\(turns)步）")
             } catch {
                 await refreshSnapshot()
                 setError(error.localizedDescription)
@@ -207,8 +208,9 @@ final class MeetingWorkspaceStore {
                 if shouldTriggerAgent {
                     let autopilotEnabled = await orchestrator.autopilotEnabled(meetingID: meeting.id)
                     if !autopilotEnabled {
-                        _ = try await orchestrator.tick(meetingID: meeting.id)
-                        setActionStatus("已发送并触发一轮 Agent")
+                        let turns = automaticAgentTurnCount(in: meeting)
+                        _ = try await orchestrator.tick(meetingID: meeting.id, rounds: turns)
+                        setActionStatus("已发送并触发一轮 Agent（\(turns)步）")
                     }
                 }
 
@@ -256,6 +258,13 @@ final class MeetingWorkspaceStore {
 
     func badgeText(for participant: Participant) -> String {
         participant.roles.map(\.rawValue).joined(separator: " • ")
+    }
+
+    private func automaticAgentTurnCount(in meeting: Meeting) -> Int {
+        let automaticSpeakers = meeting.participants.filter {
+            $0.provider.caseInsensitiveCompare("human") != .orderedSame && $0.primaryRole != .host
+        }
+        return max(1, automaticSpeakers.count)
     }
 
     private func initialize() async {
